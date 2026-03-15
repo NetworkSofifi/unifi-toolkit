@@ -57,6 +57,7 @@ function networkPulse() {
             this._initialized = true;
 
             console.log('Initializing Network Pulse dashboard');
+            await this.initControllerContext();
 
             // Load theme from localStorage
             this.theme = localStorage.getItem('unifi-toolkit-theme') || 'light';
@@ -78,12 +79,27 @@ function networkPulse() {
             this.connectWebSocket();
         },
 
+        async initControllerContext() {
+            if (!window.ControllerContext) {
+                return;
+            }
+            await ControllerContext.loadControllers();
+            ControllerContext.syncBrowserUrlParam();
+            ControllerContext.decorateLinks();
+
+            ControllerContext.initSelectorUi();
+        },
+
+        apiFetch(url, options) {
+            return window.ControllerContext ? ControllerContext.apiFetch(url, options) : fetch(url, options);
+        },
+
         /**
          * Load dashboard statistics from API
          */
         async loadStats() {
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/stats`);
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/stats`);
 
                 if (!response.ok) {
                     if (response.status === 503) {
@@ -125,7 +141,9 @@ function networkPulse() {
             }
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}${API_BASE_PATH}/ws`;
+            const wsUrl = window.ControllerContext
+                ? ControllerContext.websocketUrl(`${API_BASE_PATH}/ws`)
+                : `${protocol}//${window.location.host}${API_BASE_PATH}/ws`;
 
             console.log('Connecting to WebSocket:', wsUrl);
 
@@ -319,6 +337,13 @@ function networkPulse() {
             const ip = wanData?.wan_ip;
             if (!ip) return '--';
             return this.wanIpRevealed[wanKey] ? ip : '(click to show)';
+        },
+
+        navigateToAp(apMac) {
+            const base = `/pulse/ap/${encodeURIComponent(apMac)}`;
+            window.location.href = window.ControllerContext
+                ? ControllerContext.addControllerKeyToUrl(base)
+                : base;
         },
 
         /**

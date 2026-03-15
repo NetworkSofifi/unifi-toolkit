@@ -56,6 +56,7 @@ function dashboard() {
         // Status
         lastRefresh: null,
         refreshInterval: 60,
+        controllerKey: null,
 
         // Webhook Form
         webhookForm: {
@@ -96,6 +97,7 @@ function dashboard() {
          * Initialize the dashboard
          */
         async init() {
+            await this.initControllerContext();
             await this.loadStatus();
             await this.loadEvents();
             await this.loadStats();
@@ -112,12 +114,26 @@ function dashboard() {
             }, 60000);
         },
 
+        async initControllerContext() {
+            if (!window.ControllerContext) return;
+            await ControllerContext.loadControllers();
+            ControllerContext.syncBrowserUrlParam();
+            ControllerContext.decorateLinks();
+            this.controllerKey = ControllerContext.getSelectedControllerKey();
+
+            ControllerContext.initSelectorUi();
+        },
+
+        apiFetch(url, options) {
+            return window.ControllerContext ? ControllerContext.apiFetch(url, options) : fetch(url, options);
+        },
+
         /**
          * Load system status
          */
         async loadStatus() {
             try {
-                const response = await fetch('/threats/api/status');
+                const response = await this.apiFetch('/threats/api/status');
                 if (response.ok) {
                     const data = await response.json();
                     this.lastRefresh = this.formatDateTime(data.last_refresh);
@@ -149,7 +165,7 @@ function dashboard() {
                 if (this.sortColumn) params.append('sort', this.sortColumn);
                 if (this.sortDirection) params.append('sort_direction', this.sortDirection);
 
-                const response = await fetch(`/threats/api/events?${params}`);
+                const response = await this.apiFetch(`/threats/api/events?${params}`);
                 if (response.ok) {
                     const data = await response.json();
                     this.events = data.events;
@@ -174,7 +190,7 @@ function dashboard() {
                 if (this.filters.timeRange) params.append('time_range', this.filters.timeRange);
                 if (this.filters.includeIgnored) params.append('include_ignored', 'true');
 
-                const response = await fetch(`/threats/api/events/stats?${params}`);
+                const response = await this.apiFetch(`/threats/api/events/stats?${params}`);
                 if (response.ok) {
                     const data = await response.json();
 
@@ -198,7 +214,7 @@ function dashboard() {
          */
         async loadCategories() {
             try {
-                const response = await fetch('/threats/api/events/categories');
+                const response = await this.apiFetch('/threats/api/events/categories');
                 if (response.ok) {
                     const data = await response.json();
                     this.categories = data.categories || [];
@@ -213,7 +229,7 @@ function dashboard() {
          */
         async loadWebhooks() {
             try {
-                const response = await fetch('/threats/api/webhooks');
+                const response = await this.apiFetch('/threats/api/webhooks');
                 if (response.ok) {
                     const data = await response.json();
                     this.webhooks = data.webhooks || [];
@@ -234,7 +250,7 @@ function dashboard() {
                     ? `/threats/api/webhooks/${this.webhookForm.id}`
                     : '/threats/api/webhooks';
 
-                const response = await fetch(url, {
+                const response = await this.apiFetch(url, {
                     method: method,
                     headers: {
                         'Content-Type': 'application/json',
@@ -280,7 +296,7 @@ function dashboard() {
          */
         async testWebhook(webhookId) {
             try {
-                const response = await fetch(`/threats/api/webhooks/${webhookId}/test`, {
+                const response = await this.apiFetch(`/threats/api/webhooks/${webhookId}/test`, {
                     method: 'POST',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -305,7 +321,7 @@ function dashboard() {
             if (!confirm('Are you sure you want to delete this webhook?')) return;
 
             try {
-                const response = await fetch(`/threats/api/webhooks/${id}`, {
+                const response = await this.apiFetch(`/threats/api/webhooks/${id}`, {
                     method: 'DELETE',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -344,7 +360,7 @@ function dashboard() {
          */
         async loadIgnoreRules() {
             try {
-                const response = await fetch('/threats/api/ignore-rules');
+                const response = await this.apiFetch('/threats/api/ignore-rules');
                 if (response.ok) {
                     const data = await response.json();
                     this.ignoreRules = data.rules || [];
@@ -365,7 +381,7 @@ function dashboard() {
                     ? `/threats/api/ignore-rules/${this.ignoreRuleForm.id}`
                     : '/threats/api/ignore-rules';
 
-                const response = await fetch(url, {
+                const response = await this.apiFetch(url, {
                     method: method,
                     headers: {
                         'Content-Type': 'application/json',
@@ -414,7 +430,7 @@ function dashboard() {
             if (!confirm('Are you sure you want to delete this ignore rule?')) return;
 
             try {
-                const response = await fetch(`/threats/api/ignore-rules/${id}`, {
+                const response = await this.apiFetch(`/threats/api/ignore-rules/${id}`, {
                     method: 'DELETE',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -475,7 +491,7 @@ function dashboard() {
          */
         async viewEventDetails(eventId) {
             try {
-                const response = await fetch(`/threats/api/events/${eventId}`);
+                const response = await this.apiFetch(`/threats/api/events/${eventId}`);
                 if (response.ok) {
                     this.eventDetails = await response.json();
                     this.showEventDetails = true;
@@ -543,7 +559,9 @@ function dashboard() {
          */
         connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            const wsUrl = window.ControllerContext
+                ? ControllerContext.websocketUrl('/ws')
+                : `${protocol}//${window.location.host}/ws`;
 
             try {
                 this.ws = new WebSocket(wsUrl);

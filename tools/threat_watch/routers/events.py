@@ -8,6 +8,7 @@ from sqlalchemy import select, func, asc, desc, and_, or_
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from shared.controller_context import ControllerContext, get_controller_context
 from shared.database import get_db_session
 from tools.threat_watch.database import ThreatEvent, ThreatIgnoreRule
 
@@ -58,17 +59,23 @@ async def get_events(
     sort_direction: Optional[str] = Query(None, pattern="^(asc|desc)$", description="Sort direction (asc or desc)"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(50, ge=1, le=500, description="Events per page"),
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get paginated list of threat events with optional filtering
     """
+    controller_id = controller.controller_id
+
     # Build query
     query = select(ThreatEvent)
     count_query = select(func.count(ThreatEvent.id))
 
     # Apply filters
     filters = []
+
+    # Always scope events to current controller context
+    filters.append(ThreatEvent.controller_id == controller_id)
 
     # By default, exclude ignored events unless include_ignored is True
     if not include_ignored:
@@ -143,23 +150,31 @@ async def get_events(
 async def get_stats(
     time_range: Optional[str] = Query(None, pattern="^(24h|7d|30d)$", description="Time range shortcut (24h, 7d, 30d)"),
     include_ignored: bool = Query(False, description="Include ignored events in stats"),
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get threat statistics overview, scoped to the selected time range
     """
+    controller_id = controller.controller_id
     now = datetime.now(timezone.utc)
     day_ago = now - timedelta(days=1)
     week_ago = now - timedelta(days=7)
 
     # Count of ignored events (always returned, not scoped to time range)
     ignored_result = await db.execute(
-        select(func.count(ThreatEvent.id)).where(ThreatEvent.ignored == True)
+        select(func.count(ThreatEvent.id)).where(
+            ThreatEvent.controller_id == controller_id,
+            ThreatEvent.ignored == True,
+        )
     )
     ignored_count = ignored_result.scalar() or 0
 
     # Base filters
     base_filters = []
+
+    # Always scope stats to current controller context
+    base_filters.append(ThreatEvent.controller_id == controller_id)
 
     # Exclude ignored events unless include_ignored is True
     if not include_ignored:
@@ -178,14 +193,20 @@ async def get_stats(
     total_events = total_result.scalar() or 0
 
     # Events in last 24 hours
-    query_24h = select(func.count(ThreatEvent.id)).where(ThreatEvent.timestamp >= day_ago)
+    query_24h = select(func.count(ThreatEvent.id)).where(
+        ThreatEvent.controller_id == controller_id,
+        ThreatEvent.timestamp >= day_ago,
+    )
     if not include_ignored:
         query_24h = query_24h.where(ThreatEvent.ignored == False)
     result_24h = await db.execute(query_24h)
     events_24h = result_24h.scalar() or 0
 
     # Events in last 7 days
-    query_7d = select(func.count(ThreatEvent.id)).where(ThreatEvent.timestamp >= week_ago)
+    query_7d = select(func.count(ThreatEvent.id)).where(
+        ThreatEvent.controller_id == controller_id,
+        ThreatEvent.timestamp >= week_ago,
+    )
     if not include_ignored:
         query_7d = query_7d.where(ThreatEvent.ignored == False)
     result_7d = await db.execute(query_7d)
@@ -294,18 +315,23 @@ async def get_stats(
 async def get_timeline(
     interval: str = Query("hour", pattern="^(hour|day)$", description="Time interval (hour or day)"),
     days: int = Query(7, ge=1, le=30, description="Number of days to include"),
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get threat event counts over time for charting
     """
+    controller_id = controller.controller_id
     now = datetime.now(timezone.utc)
     start_time = now - timedelta(days=days)
 
     # Get all events in range
     result = await db.execute(
         select(ThreatEvent.timestamp)
-        .where(ThreatEvent.timestamp >= start_time)
+        .where(
+            ThreatEvent.controller_id == controller_id,
+            ThreatEvent.timestamp >= start_time,
+        )
         .order_by(ThreatEvent.timestamp)
     )
     timestamps = [row[0] for row in result.all()]
@@ -333,14 +359,19 @@ async def get_timeline(
 
 @router.get("/categories")
 async def get_categories(
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get list of all threat categories
     """
+    controller_id = controller.controller_id
     result = await db.execute(
         select(ThreatEvent.category)
-        .where(ThreatEvent.category.isnot(None))
+        .where(
+            ThreatEvent.controller_id == controller_id,
+            ThreatEvent.category.isnot(None),
+        )
         .distinct()
         .order_by(ThreatEvent.category)
     )
@@ -351,13 +382,18 @@ async def get_categories(
 @router.get("/{event_id}", response_model=ThreatEventDetail)
 async def get_event(
     event_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get detailed information for a single threat event
     """
+    controller_id = controller.controller_id
     result = await db.execute(
-        select(ThreatEvent).where(ThreatEvent.id == event_id)
+        select(ThreatEvent).where(
+            ThreatEvent.controller_id == controller_id,
+            ThreatEvent.id == event_id,
+        )
     )
     event = result.scalar_one_or_none()
 
@@ -373,15 +409,20 @@ async def ignore_event_ip(
     ignore_high: bool = Query(False, description="Ignore high severity events"),
     ignore_medium: bool = Query(True, description="Ignore medium severity events"),
     ignore_low: bool = Query(True, description="Ignore low severity events"),
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Create an ignore rule from an event's source IP.
     Quick way to add an IP to the ignore list directly from an event.
     """
+    controller_id = controller.controller_id
     # Get the event
     result = await db.execute(
-        select(ThreatEvent).where(ThreatEvent.id == event_id)
+        select(ThreatEvent).where(
+            ThreatEvent.controller_id == controller_id,
+            ThreatEvent.id == event_id,
+        )
     )
     event = result.scalar_one_or_none()
 
@@ -400,7 +441,10 @@ async def ignore_event_ip(
 
     # Check if rule already exists for this IP
     existing = await db.execute(
-        select(ThreatIgnoreRule).where(ThreatIgnoreRule.ip_address == event.src_ip)
+        select(ThreatIgnoreRule).where(
+            ThreatIgnoreRule.controller_id == controller_id,
+            ThreatIgnoreRule.ip_address == event.src_ip,
+        )
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -410,6 +454,7 @@ async def ignore_event_ip(
 
     # Create new ignore rule
     new_rule = ThreatIgnoreRule(
+        controller_id=controller_id,
         ip_address=event.src_ip,
         description=f"Quick-ignore from event {event_id}",
         ignore_high=ignore_high,
@@ -432,19 +477,23 @@ async def get_events_by_ip(
     ip_address: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get all events for a specific IP address (source or destination)
     """
+    controller_id = controller.controller_id
     # Build query for events where IP is source or destination
     query = select(ThreatEvent).where(
+        ThreatEvent.controller_id == controller_id,
         or_(
             ThreatEvent.src_ip == ip_address,
             ThreatEvent.dest_ip == ip_address
         )
     )
     count_query = select(func.count(ThreatEvent.id)).where(
+        ThreatEvent.controller_id == controller_id,
         or_(
             ThreatEvent.src_ip == ip_address,
             ThreatEvent.dest_ip == ip_address
@@ -476,6 +525,7 @@ async def get_events_by_ip(
 
 @router.get("/debug/test-fetch")
 async def debug_test_fetch(
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
@@ -485,14 +535,12 @@ async def debug_test_fetch(
     the v2 traffic-flows API (Network 10.x+) and legacy stat/ips/event API,
     and returns diagnostic information about the responses.
     """
-    from shared.models.unifi_config import UniFiConfig
-    from shared.unifi_client import UniFiClient
-    from shared.crypto import decrypt_password, decrypt_api_key
+    from shared.controller_registry import get_default_controller, create_unifi_client
     import time
 
     # Get UniFi config
-    result = await db.execute(select(UniFiConfig).where(UniFiConfig.id == 1))
-    unifi_config = result.scalar_one_or_none()
+    from shared.controller_registry import get_controller_by_key
+    unifi_config = await get_controller_by_key(db, controller.controller_key, include_inactive=False)
 
     if not unifi_config:
         return {
@@ -501,29 +549,13 @@ async def debug_test_fetch(
             "hint": "Configure UniFi controller in dashboard settings"
         }
 
-    # Decrypt credentials
-    password = None
-    api_key = None
     try:
-        if unifi_config.password_encrypted:
-            password = decrypt_password(unifi_config.password_encrypted)
-        if unifi_config.api_key_encrypted:
-            api_key = decrypt_api_key(unifi_config.api_key_encrypted)
+        client = create_unifi_client(unifi_config)
     except Exception as e:
         return {
             "success": False,
             "error": f"Failed to decrypt credentials: {str(e)}"
         }
-
-    # Create client
-    client = UniFiClient(
-        host=unifi_config.controller_url,
-        username=unifi_config.username,
-        password=password,
-        api_key=api_key,
-        site=unifi_config.site_id,
-        verify_ssl=unifi_config.verify_ssl
-    )
 
     try:
         # Connect

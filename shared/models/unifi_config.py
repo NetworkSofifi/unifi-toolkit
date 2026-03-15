@@ -8,7 +8,10 @@ from shared.models.base import Base
 
 class UniFiConfig(Base):
     """
-    Stores UniFi controller configuration (single row)
+    Legacy single-row UniFi controller configuration.
+
+    Kept for backward compatibility while `controller_config` becomes the
+    primary registry for multi-controller support.
     Supports both legacy (username/password) and UniFi OS (API key) authentication
     """
     __tablename__ = "unifi_config"

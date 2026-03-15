@@ -6,7 +6,7 @@ This is the main application that mounts all available tools as sub-applications
 import os
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status, Depends
 from fastapi.responses import HTMLResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.templating import Jinja2Templates
@@ -16,6 +16,11 @@ from pathlib import Path
 from shared.database import get_database
 from shared.config import get_settings
 from shared.websocket_manager import get_ws_manager
+from shared.controller_context import (
+    ControllerContext,
+    get_controller_context,
+    resolve_websocket_controller_context,
+)
 from shared.unifi_session import close_shared_client
 from tools.wifi_stalker.main import create_app as create_stalker_app
 from tools.wifi_stalker.scheduler import start_scheduler, stop_scheduler
@@ -254,7 +259,9 @@ async def health_check():
 
 
 @app.get("/api/debug-info")
-async def get_debug_info():
+async def get_debug_info(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """
     Get non-sensitive debug information for issue reporting.
 
@@ -275,9 +282,9 @@ async def get_debug_info():
     is_docker = Path("/.dockerenv").exists()
 
     # Get cached info (if available)
-    gateway_info = cache.get_gateway_info()
-    ips_settings = cache.get_ips_settings()
-    ap_info = cache.get_ap_info()
+    gateway_info = cache.get_gateway_info(controller_key=controller.controller_key)
+    ips_settings = cache.get_ips_settings(controller_key=controller.controller_key)
+    ap_info = cache.get_ap_info(controller_key=controller.controller_key)
 
     # Build response with non-sensitive info only
     debug_info = {
@@ -353,24 +360,25 @@ async def check_for_update():
 
 
 @app.get("/api/system-status")
-async def get_system_status():
+async def get_system_status(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """
     Get system status including gateway info, health, stats, and IPS settings.
     Also caches gateway info and IPS settings for use by other endpoints.
     """
-    from shared.unifi_client import UniFiClient
-    from shared.crypto import decrypt_password, decrypt_api_key
-    from shared.models.unifi_config import UniFiConfig
+    from shared.controller_registry import get_controller_by_key, create_unifi_client
     from shared import cache
 
-    db = get_database()
-
     try:
-        # Get UniFi config from database
+        db = get_database()
+        config = None
         async for session in db.get_session():
-            from sqlalchemy import select
-            result = await session.execute(select(UniFiConfig))
-            config = result.scalar_one_or_none()
+            config = await get_controller_by_key(
+                session,
+                controller_key=controller.controller_key,
+                include_inactive=False,
+            )
             break  # Only need one iteration
 
         if not config:
@@ -379,24 +387,8 @@ async def get_system_status():
                 "error": "UniFi controller not configured"
             }
 
-        # Decrypt credentials
-        password = None
-        api_key = None
-        if config.password_encrypted:
-            password = decrypt_password(config.password_encrypted)
-        if config.api_key_encrypted:
-            api_key = decrypt_api_key(config.api_key_encrypted)
-
-        # Create client and get system info
-        # is_unifi_os is auto-detected during connection
-        client = UniFiClient(
-            host=config.controller_url,
-            username=config.username,
-            password=password,
-            api_key=api_key,
-            site=config.site_id,
-            verify_ssl=config.verify_ssl
-        )
+        # Create client from selected controller context.
+        client = create_unifi_client(config)
 
         try:
             connected = await client.connect()
@@ -426,9 +418,9 @@ async def get_system_status():
             cache.set_gateway_info({
                 **gateway_info,
                 "is_unifi_os": client.is_unifi_os
-            })
+            }, controller_key=config.controller_key)
             if ips_settings:
-                cache.set_ips_settings(ips_settings)
+                cache.set_ips_settings(ips_settings, controller_key=config.controller_key)
 
             # Cache AP info for debug-info endpoint
             from shared.unifi_client import get_friendly_model_name, EXPRESS_MODEL_CODES
@@ -448,11 +440,12 @@ async def get_system_status():
                         "display_name": get_friendly_model_name(model_code)
                     })
             ap_list.sort(key=lambda x: (x.get('name') or '').lower())
-            cache.set_ap_info(ap_list)
+            cache.set_ap_info(ap_list, controller_key=config.controller_key)
 
             return {
                 "configured": True,
                 "connected": True,
+                "controller_key": config.controller_key,
                 "system": system_info,
                 "health": health,
                 "gateway": gateway_info,
@@ -489,8 +482,19 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.warning("WebSocket connection rejected: not authenticated")
             return
 
+    selected_controller_key = websocket.query_params.get("controller_key")
+    try:
+        ws_context = await resolve_websocket_controller_context(selected_controller_key)
+    except Exception:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        logger.warning(
+            "WebSocket connection rejected: invalid controller selection (controller_key=%s)",
+            selected_controller_key or "default",
+        )
+        return
+
     ws_manager = get_ws_manager()
-    await ws_manager.connect(websocket)
+    await ws_manager.connect(websocket, controller_key=ws_context.controller_key if ws_context else None)
     try:
         while True:
             # Wait for messages from client (e.g., ping)

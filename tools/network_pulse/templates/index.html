@@ -6,6 +6,8 @@
     <title>Network Pulse - Real-time Network Monitor</title>
     <link rel="icon" type="image/jpeg" href="/static/images/favicon16x16.jpg">
     <link rel="stylesheet" href="/pulse/static/css/styles.css">
+    <link rel="stylesheet" href="/static/css/controller-selector.css">
+    <script src="/static/js/controller-context.js"></script>
     <script>
         // Apply saved theme immediately to prevent flash
         (function() {
@@ -21,10 +23,15 @@
         <!-- Header -->
         <header class="dashboard-header">
             <div class="header-left">
-                <a href="/" class="back-link">← Back to Dashboard</a>
+                <a href="/" class="back-link" data-controller-link>← Back to Dashboard</a>
             </div>
             <div class="header-center">
                 <h1>💓 Network Pulse</h1>
+                <div id="controller-selector-wrap" class="controller-selector-wrap" style="margin-top: 0.5rem; display: none; justify-content: center;">
+                    <label for="controller-selector">Controller</label>
+                    <select id="controller-selector" class="controller-selector"></select>
+                    <div id="controller-current-badge" class="controller-current-badge" style="display: none;"></div>
+                </div>
             </div>
             <div class="header-right">
                 <button @click="toggleFullscreen()" class="fullscreen-toggle" title="Toggle Fullscreen">
@@ -168,10 +175,10 @@
                         <template x-for="ap in data.access_points" :key="ap.mac">
                             <div class="ap-card clickable"
                                  :class="{'ap-online': ap.state === 1, 'ap-offline': ap.state !== 1}"
-                                 @click="window.location.href = '/pulse/ap/' + encodeURIComponent(ap.mac)"
+                                 @click="navigateToAp(ap.mac)"
                                  role="button"
                                  tabindex="0"
-                                 @keydown.enter="window.location.href = '/pulse/ap/' + encodeURIComponent(ap.mac)">
+                                 @keydown.enter="navigateToAp(ap.mac)">
                                 <div class="ap-status-dot" :class="ap.state === 1 ? 'online' : 'offline'"></div>
                                 <div class="ap-name" x-text="ap.name"></div>
                                 <div class="ap-clients">
@@ -356,7 +363,7 @@
 `;
 
                 try {
-                    const response = await fetch('/api/debug-info');
+                    const response = await (window.ControllerContext ? ControllerContext.apiFetch('/api/debug-info') : fetch('/api/debug-info'));
                     const info = await response.json();
 
                     body += `- **App Version:** ${info.app_version}\n`;

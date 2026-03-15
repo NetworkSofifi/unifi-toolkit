@@ -13,12 +13,16 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.controller_context import ControllerContext, get_controller_context
 from shared.database import get_db_session
 from shared.unifi_client import UniFiClient
 from tools.wifi_stalker.database import (
     ConnectionHistory,
     HourlyPresence,
     TrackedDevice,
+    scoped_connection_history_query,
+    scoped_hourly_presence_query,
+    scoped_tracked_devices_query,
 )
 from tools.wifi_stalker.models import (
     DeviceCreate,
@@ -47,14 +51,17 @@ router = APIRouter(prefix="/api/devices", tags=["devices"])
 @router.post("", response_model=DeviceResponse, status_code=201)
 async def create_device(
     device: DeviceCreate,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Add a new device to track
     """
+    controller_id = controller.controller_id
+
     # Check if device already exists
     result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.mac_address == device.mac_address)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.mac_address == device.mac_address)
     )
     existing_device = result.scalar_one_or_none()
 
@@ -66,6 +73,7 @@ async def create_device(
 
     # Create new device
     new_device = TrackedDevice(
+        controller_id=controller_id,
         mac_address=device.mac_address,
         friendly_name=device.friendly_name,
         site_id=device.site_id,
@@ -86,13 +94,15 @@ async def create_device(
 
 @router.get("", response_model=DeviceListResponse)
 async def list_devices(
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get all tracked devices
     """
+    controller_id = controller.controller_id
     result = await db.execute(
-        select(TrackedDevice).order_by(TrackedDevice.added_at.desc())
+        scoped_tracked_devices_query(controller_id).order_by(TrackedDevice.added_at.desc())
     )
     devices = result.scalars().all()
 
@@ -105,13 +115,15 @@ async def list_devices(
 @router.get("/{device_id}", response_model=DeviceResponse)
 async def get_device(
     device_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get a specific device by ID
     """
+    controller_id = controller.controller_id
     result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = result.scalar_one_or_none()
 
@@ -124,15 +136,17 @@ async def get_device(
 @router.get("/{device_id}/details", response_model=DeviceDetailResponse)
 async def get_device_details(
     device_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     unifi_client: UniFiClient = Depends(get_unifi_client),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get detailed device information including live UniFi data
     """
+    controller_id = controller.controller_id
     # Get device from database
     result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = result.scalar_one_or_none()
 
@@ -212,13 +226,15 @@ async def get_device_details(
 @router.delete("/{device_id}", response_model=SuccessResponse)
 async def delete_device(
     device_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Remove a device from tracking
     """
+    controller_id = controller.controller_id
     result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = result.scalar_one_or_none()
 
@@ -239,14 +255,16 @@ async def get_device_history(
     device_id: int,
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get roaming history for a specific device
     """
+    controller_id = controller.controller_id
     # Check if device exists
     device_result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = device_result.scalar_one_or_none()
 
@@ -255,7 +273,7 @@ async def get_device_history(
 
     # Get history entries
     history_result = await db.execute(
-        select(ConnectionHistory)
+        scoped_connection_history_query(controller_id)
         .where(ConnectionHistory.device_id == device_id)
         .order_by(ConnectionHistory.connected_at.desc())
         .limit(limit)
@@ -265,7 +283,10 @@ async def get_device_history(
 
     # Get total count
     count_result = await db.execute(
-        select(func.count()).where(ConnectionHistory.device_id == device_id)
+        select(func.count()).select_from(ConnectionHistory).where(
+            ConnectionHistory.controller_id == controller_id,
+            ConnectionHistory.device_id == device_id,
+        )
     )
     total = count_result.scalar()
 
@@ -279,15 +300,17 @@ async def get_device_history(
 @router.post("/{device_id}/block", response_model=SuccessResponse)
 async def block_device(
     device_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     unifi_client: UniFiClient = Depends(get_unifi_client),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Block a device in UniFi
     """
+    controller_id = controller.controller_id
     # Get device from database
     result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = result.scalar_one_or_none()
 
@@ -306,7 +329,7 @@ async def block_device(
             await db.commit()
 
             # Trigger blocked webhook
-            await trigger_webhooks(db, 'blocked', device)
+            await trigger_webhooks(db, controller_id, 'blocked', device)
 
             return SuccessResponse(
                 success=True,
@@ -321,15 +344,17 @@ async def block_device(
 @router.post("/{device_id}/unblock", response_model=SuccessResponse)
 async def unblock_device(
     device_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     unifi_client: UniFiClient = Depends(get_unifi_client),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Unblock a device in UniFi
     """
+    controller_id = controller.controller_id
     # Get device from database
     result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = result.scalar_one_or_none()
 
@@ -348,7 +373,7 @@ async def unblock_device(
             await db.commit()
 
             # Trigger unblocked webhook
-            await trigger_webhooks(db, 'unblocked', device)
+            await trigger_webhooks(db, controller_id, 'unblocked', device)
 
             return SuccessResponse(
                 success=True,
@@ -364,15 +389,17 @@ async def unblock_device(
 async def update_unifi_name(
     device_id: int,
     name: str = Query(..., description="New friendly name"),
+    controller: ControllerContext = Depends(get_controller_context),
     unifi_client: UniFiClient = Depends(get_unifi_client),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Update device friendly name in UniFi
     """
+    controller_id = controller.controller_id
     # Get device from database
     result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = result.scalar_one_or_none()
 
@@ -402,6 +429,7 @@ async def update_unifi_name(
 
 @router.get("/discover/unifi", response_model=UniFiClientsResponse)
 async def discover_unifi_clients(
+    controller: ControllerContext = Depends(get_controller_context),
     unifi_client: UniFiClient = Depends(get_unifi_client),
     db: AsyncSession = Depends(get_db_session)
 ):
@@ -411,9 +439,10 @@ async def discover_unifi_clients(
     Returns list of clients with their MAC address, name (friendly name or hostname),
     and whether they are already being tracked.
     """
+    controller_id = controller.controller_id
     try:
         # Get all tracked devices to mark which ones are already tracked
-        tracked_result = await db.execute(select(TrackedDevice))
+        tracked_result = await db.execute(scoped_tracked_devices_query(controller_id))
         tracked_devices = tracked_result.scalars().all()
         tracked_macs = {device.mac_address.lower() for device in tracked_devices}
 
@@ -465,14 +494,16 @@ async def export_device_history(
     device_id: int,
     start_date: Optional[str] = Query(None, description="Start date (ISO format)"),
     end_date: Optional[str] = Query(None, description="End date (ISO format)"),
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Export device connection history as CSV
     """
+    controller_id = controller.controller_id
     # Get device from database
     result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = result.scalar_one_or_none()
 
@@ -480,7 +511,7 @@ async def export_device_history(
         raise HTTPException(status_code=404, detail="Device not found")
 
     # Build query for history
-    query = select(ConnectionHistory).where(
+    query = scoped_connection_history_query(controller_id).where(
         ConnectionHistory.device_id == device_id
     )
 
@@ -564,6 +595,7 @@ async def export_device_history(
 async def get_dwell_time(
     device_id: int,
     window: str = Query(default="7d", pattern="^(24h|7d|30d|all)$"),
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
@@ -574,9 +606,10 @@ async def get_dwell_time(
         device_id: ID of the device
         window: Time window - "24h", "7d", "30d", or "all"
     """
+    controller_id = controller.controller_id
     # Check if device exists
     device_result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = device_result.scalar_one_or_none()
 
@@ -595,7 +628,7 @@ async def get_dwell_time(
         start_time = None
 
     # Build query for connection history (wireless only)
-    query = select(ConnectionHistory).where(
+    query = scoped_connection_history_query(controller_id).where(
         ConnectionHistory.device_id == device_id,
         ConnectionHistory.is_wired == False,
         ConnectionHistory.ap_name.isnot(None)
@@ -645,15 +678,17 @@ async def get_dwell_time(
 @router.get("/{device_id}/analytics/favorite-ap", response_model=FavoriteAPResponse)
 async def get_favorite_ap(
     device_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get the favorite AP for a device (most time spent over 30 days).
     Uses most recent connection as tie-breaker.
     """
+    controller_id = controller.controller_id
     # Check if device exists
     device_result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = device_result.scalar_one_or_none()
 
@@ -666,7 +701,7 @@ async def get_favorite_ap(
 
     # Get connection history for 30 days (wireless only)
     result = await db.execute(
-        select(ConnectionHistory).where(
+        scoped_connection_history_query(controller_id).where(
             ConnectionHistory.device_id == device_id,
             ConnectionHistory.is_wired == False,
             ConnectionHistory.ap_name.isnot(None),
@@ -734,15 +769,17 @@ async def get_favorite_ap(
 @router.get("/{device_id}/analytics/presence-pattern", response_model=PresencePatternResponse)
 async def get_presence_pattern(
     device_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get presence pattern heat map data for a device.
     Returns a 24x7 matrix showing average minutes connected per hour slot.
     """
+    controller_id = controller.controller_id
     # Check if device exists
     device_result = await db.execute(
-        select(TrackedDevice).where(TrackedDevice.id == device_id)
+        scoped_tracked_devices_query(controller_id).where(TrackedDevice.id == device_id)
     )
     device = device_result.scalar_one_or_none()
 
@@ -751,7 +788,7 @@ async def get_presence_pattern(
 
     # Get all hourly presence data for this device
     result = await db.execute(
-        select(HourlyPresence).where(HourlyPresence.device_id == device_id)
+        scoped_hourly_presence_query(controller_id).where(HourlyPresence.device_id == device_id)
     )
     presence_records = result.scalars().all()
 

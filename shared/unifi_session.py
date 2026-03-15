@@ -1,136 +1,126 @@
 """
-Shared UniFi session singleton.
+Shared UniFi session registry.
 
-Provides a single persistent UniFiClient instance shared across all schedulers
-(Threat Watch, Wi-Fi Stalker, Network Pulse) to avoid repeated logins that
-trigger fail2ban on username/password auth controllers.
+Provides persistent UniFiClient instances keyed by controller key to avoid
+repeated logins and support a multi-controller future architecture.
 
-The client initializes lazily on the first scheduler call and reconnects
-automatically if the session goes stale. Config changes (via the web UI)
-invalidate the shared client so the next poll picks up new credentials.
+Backward compatibility:
+- `get_shared_client()` still returns the default controller client.
+- Existing schedulers can remain unchanged during the transition.
 """
 import logging
-from typing import Optional
-
-from sqlalchemy import select
+from typing import Dict, Optional
 
 from shared.database import get_database
-from shared.models.unifi_config import UniFiConfig
+from shared.controller_registry import create_unifi_client, get_default_controller, get_controller_by_key
 from shared.unifi_client import UniFiClient
-from shared.crypto import decrypt_password, decrypt_api_key
 
 logger = logging.getLogger(__name__)
 
-# Singleton client instance
-_shared_client: Optional[UniFiClient] = None
+# Persistent clients keyed by controller key
+_shared_clients: Dict[str, UniFiClient] = {}
 
 
-async def get_shared_client() -> Optional[UniFiClient]:
+async def _get_or_connect_client(controller_key: str, build_client) -> Optional[UniFiClient]:
     """
-    Get the shared UniFi client, creating and connecting it if needed.
-
-    On first call: reads config from DB, decrypts credentials, creates client,
-    and connects. On subsequent calls: returns the existing connected client.
-    If the session is closed or stale, reconnects automatically.
-
-    Returns:
-        Connected UniFiClient, or None if no config or connection fails.
+    Reuse a live client if possible, otherwise build and connect a new one.
     """
-    global _shared_client
+    existing = _shared_clients.get(controller_key)
+    if existing is not None and existing._session is not None and not existing._session.closed:
+        return existing
 
-    # If we have a client with a live session, return it
-    if _shared_client is not None and _shared_client._session is not None and not _shared_client._session.closed:
-        return _shared_client
-
-    # Need to create or reconnect
-    logger.info("Initializing shared UniFi session...")
-
-    # Clean up stale client if any
-    if _shared_client is not None:
+    if existing is not None:
         try:
-            await _shared_client.disconnect()
+            await existing.disconnect()
         except Exception:
             pass
-        _shared_client = None
+        _shared_clients.pop(controller_key, None)
 
-    # Read config from DB
+    client = build_client()
+    connected = await client.connect()
+    if not connected:
+        await client.disconnect()
+        return None
+
+    _shared_clients[controller_key] = client
+    return client
+
+
+async def get_shared_client(controller_key: Optional[str] = None) -> Optional[UniFiClient]:
+    """
+    Get a shared UniFi client.
+
+    Args:
+        controller_key: Optional controller key. When omitted, uses the current
+            default controller from the registry.
+
+    Returns:
+        Connected UniFiClient, or None if no default controller exists or
+        connection fails.
+    """
     db_instance = get_database()
     async for session in db_instance.get_session():
-        config_result = await session.execute(
-            select(UniFiConfig).where(UniFiConfig.id == 1)
-        )
-        unifi_config = config_result.scalar_one_or_none()
-
-        if not unifi_config:
-            logger.warning("No UniFi configuration found, cannot create shared session")
+        if controller_key:
+            controller = await get_controller_by_key(session, controller_key, include_inactive=False)
+        else:
+            controller = await get_default_controller(session)
+        if not controller:
+            logger.warning(
+                "No controller configured for shared session (controller_key=%s)",
+                controller_key or "default"
+            )
             return None
 
-        # Decrypt credentials
-        password = None
-        api_key = None
+        logger.info("Ensuring shared UniFi session for controller '%s'", controller.controller_key)
+        return await _get_or_connect_client(
+            controller.controller_key,
+            lambda: create_unifi_client(controller),
+        )
 
+
+async def invalidate_shared_client(controller_key: Optional[str] = None):
+    """
+    Disconnect and clear shared clients.
+
+    Called when controller config changes so next scheduler run creates fresh clients.
+    """
+    if not _shared_clients:
+        return
+
+    if controller_key:
+        client = _shared_clients.get(controller_key)
+        if not client:
+            return
+        logger.info("Invalidating shared UniFi session for controller '%s'", controller_key)
         try:
-            if unifi_config.password_encrypted:
-                password = decrypt_password(unifi_config.password_encrypted)
-            if unifi_config.api_key_encrypted:
-                api_key = decrypt_api_key(unifi_config.api_key_encrypted)
-        except Exception as e:
-            logger.error(f"Failed to decrypt UniFi credentials: {e}")
-            return None
-
-        # Create and connect client
-        client = UniFiClient(
-            host=unifi_config.controller_url,
-            username=unifi_config.username,
-            password=password,
-            api_key=api_key,
-            site=unifi_config.site_id,
-            verify_ssl=unifi_config.verify_ssl
-        )
-
-        connected = await client.connect()
-        if not connected:
-            logger.error("Failed to connect shared UniFi session")
             await client.disconnect()
-            return None
-
-        _shared_client = client
-        logger.info("Shared UniFi session established")
-        break  # Exit the async for loop
-
-    return _shared_client
-
-
-async def invalidate_shared_client():
-    """
-    Disconnect and clear the shared client.
-
-    Called when UniFi config is saved via the web UI so the next scheduler
-    run creates a fresh client with the updated credentials.
-    """
-    global _shared_client
-
-    if _shared_client is not None:
-        logger.info("Invalidating shared UniFi session (config changed)")
-        try:
-            await _shared_client.disconnect()
         except Exception as e:
-            logger.debug(f"Error disconnecting shared client: {e}")
-        _shared_client = None
+            logger.debug("Error disconnecting shared client '%s': %s", controller_key, e)
+        _shared_clients.pop(controller_key, None)
+        return
+
+    logger.info("Invalidating all shared UniFi sessions (config changed)")
+    for key, client in list(_shared_clients.items()):
+        try:
+            await client.disconnect()
+        except Exception as e:
+            logger.debug("Error disconnecting shared client '%s': %s", key, e)
+    _shared_clients.clear()
 
 
 async def close_shared_client():
     """
-    Graceful shutdown — disconnect and clear the shared client.
+    Graceful shutdown — disconnect and clear all shared clients.
 
     Called from the app lifespan shutdown handler.
     """
-    global _shared_client
+    if not _shared_clients:
+        return
 
-    if _shared_client is not None:
-        logger.info("Closing shared UniFi session (shutdown)")
+    logger.info("Closing shared UniFi sessions (shutdown)")
+    for key, client in list(_shared_clients.items()):
         try:
-            await _shared_client.disconnect()
+            await client.disconnect()
         except Exception as e:
-            logger.debug(f"Error closing shared client: {e}")
-        _shared_client = None
+            logger.debug(f"Error closing shared client '{key}': {e}")
+    _shared_clients.clear()

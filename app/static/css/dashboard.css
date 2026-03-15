@@ -607,6 +607,11 @@ body {
     background: var(--secondary-color);
 }
 
+.btn-small {
+    padding: 0.35rem 0.65rem;
+    font-size: 0.8rem;
+}
+
 /* Info Cards Row */
 .info-row {
     display: grid;
@@ -981,7 +986,8 @@ body {
 }
 
 .form-group input[type="text"],
-.form-group input[type="password"] {
+.form-group input[type="password"],
+.form-group select {
     width: 100%;
     padding: 0.75rem;
     border: 1px solid var(--border-color);
@@ -993,7 +999,8 @@ body {
 }
 
 .form-group input[type="text"]:focus,
-.form-group input[type="password"]:focus {
+.form-group input[type="password"]:focus,
+.form-group select:focus {
     outline: none;
     border-color: var(--primary-color);
 }

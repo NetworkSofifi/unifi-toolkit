@@ -15,6 +15,8 @@ function dashboard() {
         trackedCount: 0,
         connectedCount: 0,
         refreshInterval: 60,
+        controllerKey: null,
+        controllersLoaded: false,
         unifiClients: [],
         unifiClientSearch: '',
         selectedClients: new Set(),
@@ -83,6 +85,7 @@ function dashboard() {
          */
         async init() {
             console.log('Initializing Wi-Fi Stalker dashboard');
+            await this.initControllerContext();
             await this.loadDevices();
             await this.loadStatus();
             await this.loadWebhooks();
@@ -101,13 +104,41 @@ function dashboard() {
             }, 60000);
         },
 
+        async initControllerContext() {
+            if (!window.ControllerContext) {
+                return;
+            }
+            await ControllerContext.loadControllers();
+            ControllerContext.syncBrowserUrlParam();
+            ControllerContext.decorateLinks();
+            this.controllerKey = ControllerContext.getSelectedControllerKey();
+            this.controllersLoaded = true;
+            this.setupControllerSelectorUi();
+        },
+
+        setupControllerSelectorUi() {
+            if (!window.ControllerContext) {
+                return;
+            }
+            ControllerContext.initSelectorUi();
+        },
+
+        apiFetch(url, options) {
+            if (window.ControllerContext) {
+                return ControllerContext.apiFetch(url, options);
+            }
+            return fetch(url, options);
+        },
+
         /**
          * Connect to WebSocket for real-time device updates
          */
         connectWebSocket() {
             // Determine WebSocket protocol (ws:// or wss://)
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}${API_BASE_PATH}/ws`;
+            const wsUrl = window.ControllerContext
+                ? ControllerContext.websocketUrl(`${API_BASE_PATH}/ws`)
+                : `${protocol}//${window.location.host}${API_BASE_PATH}/ws`;
 
             console.log('Connecting to WebSocket:', wsUrl);
 
@@ -213,7 +244,7 @@ function dashboard() {
          */
         async loadDevices() {
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/devices`);
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/devices`);
                 const data = await response.json();
                 this.devices = data.devices;
                 console.log(`Loaded ${this.devices.length} devices`);
@@ -231,7 +262,7 @@ function dashboard() {
          */
         async loadStatus() {
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/status`);
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/status`);
                 const data = await response.json();
                 this.lastRefresh = this.formatDateTime(data.last_refresh);
                 this.trackedCount = data.tracked_devices;
@@ -271,7 +302,7 @@ function dashboard() {
          */
         async addDevice() {
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/devices`, {
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/devices`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -308,7 +339,7 @@ function dashboard() {
             }
 
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/devices/${deviceId}`, {
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/devices/${deviceId}`, {
                     method: 'DELETE',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -335,7 +366,7 @@ function dashboard() {
                 // Find the device in our devices array
                 this.currentDevice = this.devices.find(d => d.id === deviceId);
 
-                const response = await fetch(`${API_BASE_PATH}/api/devices/${deviceId}/history`);
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/devices/${deviceId}/history`);
                 const data = await response.json();
                 this.history = data.history;
                 this.showHistory = true;
@@ -354,7 +385,7 @@ function dashboard() {
             this.unifiClientSearch = '';
 
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/devices/discover/unifi`);
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/devices/discover/unifi`);
                 if (!response.ok) {
                     const error = await response.json();
                     throw new Error(error.detail || 'Failed to load clients');
@@ -420,7 +451,7 @@ function dashboard() {
                 }
 
                 try {
-                    const response = await fetch(`${API_BASE_PATH}/api/devices`, {
+                    const response = await this.apiFetch(`${API_BASE_PATH}/api/devices`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -493,7 +524,7 @@ function dashboard() {
             try {
                 // Start all requests in parallel
                 const promises = [
-                    fetch(`${API_BASE_PATH}/api/devices/${deviceId}/details`).then(r => r.json())
+                    this.apiFetch(`${API_BASE_PATH}/api/devices/${deviceId}/details`).then(r => r.json())
                 ];
 
                 // Add analytics requests for wireless devices
@@ -535,7 +566,7 @@ function dashboard() {
             }
 
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/devices/${deviceId}/block`, {
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/devices/${deviceId}/block`, {
                     method: 'POST',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -561,7 +592,7 @@ function dashboard() {
          */
         async unblockDevice(deviceId) {
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/devices/${deviceId}/unblock`, {
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/devices/${deviceId}/unblock`, {
                     method: 'POST',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -591,7 +622,7 @@ function dashboard() {
             if (!newName) return;
 
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/devices/${deviceId}/unifi-name?name=${encodeURIComponent(newName)}`, {
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/devices/${deviceId}/unifi-name?name=${encodeURIComponent(newName)}`, {
                     method: 'PUT',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -757,7 +788,9 @@ function dashboard() {
          */
         exportHistory(deviceId) {
             // Trigger download by navigating to export endpoint
-            window.location.href = `${API_BASE_PATH}/api/devices/${deviceId}/history/export`;
+            window.location.href = window.ControllerContext
+                ? ControllerContext.addControllerKeyToUrl(`${API_BASE_PATH}/api/devices/${deviceId}/history/export`)
+                : `${API_BASE_PATH}/api/devices/${deviceId}/history/export`;
             this.showToast('Exporting history to CSV...', 'info');
         },
 
@@ -790,7 +823,7 @@ function dashboard() {
          */
         async loadWebhooks() {
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/webhooks`);
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/webhooks`);
                 const data = await response.json();
                 this.webhooks = data.webhooks;
                 console.log(`Loaded ${this.webhooks.length} webhooks`);
@@ -809,7 +842,7 @@ function dashboard() {
                     ? `${API_BASE_PATH}/api/webhooks/${this.webhookForm.id}`
                     : `${API_BASE_PATH}/api/webhooks`;
 
-                const response = await fetch(url, {
+                const response = await this.apiFetch(url, {
                     method: method,
                     headers: {
                         'Content-Type': 'application/json',
@@ -851,7 +884,7 @@ function dashboard() {
             }
 
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/webhooks/${webhookId}`, {
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/webhooks/${webhookId}`, {
                     method: 'DELETE',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -875,7 +908,7 @@ function dashboard() {
          */
         async testWebhook(webhookId) {
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/webhooks/${webhookId}/test`, {
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/webhooks/${webhookId}/test`, {
                     method: 'POST',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
@@ -924,7 +957,7 @@ function dashboard() {
             if (!id) return;
 
             try {
-                const response = await fetch(
+                const response = await this.apiFetch(
                     `${API_BASE_PATH}/api/devices/${id}/analytics/dwell-time?window=${this.dwellTimeWindow}`
                 );
                 this.dwellTimeData = await response.json();
@@ -944,7 +977,7 @@ function dashboard() {
             if (!id) return;
 
             try {
-                const response = await fetch(
+                const response = await this.apiFetch(
                     `${API_BASE_PATH}/api/devices/${id}/analytics/favorite-ap`
                 );
                 this.favoriteAP = await response.json();
@@ -961,7 +994,7 @@ function dashboard() {
             if (!id) return;
 
             try {
-                const response = await fetch(
+                const response = await this.apiFetch(
                     `${API_BASE_PATH}/api/devices/${id}/analytics/presence-pattern`
                 );
                 this.presencePattern = await response.json();

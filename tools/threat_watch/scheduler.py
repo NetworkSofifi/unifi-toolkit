@@ -4,23 +4,32 @@ Background task scheduler for polling IDS/IPS events
 import json
 import logging
 from datetime import datetime, timezone, timedelta
+from typing import Dict, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.database import get_database
-from shared.config import get_settings
+from shared.controller_registry import list_enabled_controllers, ResolvedController
 from shared.websocket_manager import get_ws_manager
 from shared.webhooks import deliver_threat_webhook
 from shared.unifi_session import get_shared_client, invalidate_shared_client
-from tools.threat_watch.database import ThreatEvent, ThreatWebhookConfig, ThreatIgnoreRule
+from tools.threat_watch.database import (
+    ThreatEvent,
+    ThreatWebhookConfig,
+    ThreatIgnoreRule,
+    scoped_threat_events_query,
+    scoped_threat_ignore_rules_query,
+    scoped_threat_webhooks_query,
+)
 
 logger = logging.getLogger(__name__)
 
 # Global scheduler instance
 _scheduler: AsyncIOScheduler = None
 _last_refresh: datetime = None
+_last_refresh_by_controller: Dict[str, datetime] = {}
 _last_purge: datetime = None
 
 # Default refresh interval (seconds)
@@ -39,8 +48,10 @@ def get_scheduler() -> AsyncIOScheduler:
     return _scheduler
 
 
-def get_last_refresh() -> datetime:
+def get_last_refresh(controller_key: Optional[str] = None) -> datetime:
     """Get the timestamp of the last successful refresh"""
+    if controller_key:
+        return _last_refresh_by_controller.get(controller_key)
     return _last_refresh
 
 
@@ -146,6 +157,7 @@ def _parse_legacy_ips_event(event: dict) -> dict:
 
 async def trigger_threat_webhooks(
     session: AsyncSession,
+    controller_id: int,
     event_data: dict,
     action: str
 ):
@@ -161,7 +173,7 @@ async def trigger_threat_webhooks(
 
     # Get all enabled webhooks
     result = await session.execute(
-        select(ThreatWebhookConfig).where(ThreatWebhookConfig.enabled == True)
+        scoped_threat_webhooks_query(controller_id).where(ThreatWebhookConfig.enabled == True)
     )
     webhooks = result.scalars().all()
 
@@ -195,7 +207,7 @@ async def trigger_threat_webhooks(
             logger.error(f"Error triggering webhook {webhook.name}: {e}")
 
 
-async def check_ignore_rules(session: AsyncSession, event_data: dict) -> tuple[bool, int | None]:
+async def check_ignore_rules(session: AsyncSession, controller_id: int, event_data: dict) -> tuple[bool, int | None]:
     """
     Check if an event should be ignored based on configured rules.
 
@@ -212,7 +224,7 @@ async def check_ignore_rules(session: AsyncSession, event_data: dict) -> tuple[b
 
     # Get all enabled ignore rules
     result = await session.execute(
-        select(ThreatIgnoreRule).where(ThreatIgnoreRule.enabled == True)
+        scoped_threat_ignore_rules_query(controller_id).where(ThreatIgnoreRule.enabled == True)
     )
     rules = result.scalars().all()
 
@@ -257,94 +269,35 @@ async def refresh_threat_events():
     global _last_refresh
 
     try:
-        logger.info("Starting threat events refresh task")
-
-        # Get shared UniFi client (reuses persistent session)
-        unifi_client = await get_shared_client()
-        if not unifi_client:
-            logger.warning("No UniFi connection available, skipping refresh")
-            return
-
+        logger.info("Starting threat events refresh task across controllers")
         db_instance = get_database()
         async for session in db_instance.get_session():
-            # Get the most recent event timestamp from our database
-            latest_result = await session.execute(
-                select(func.max(ThreatEvent.timestamp))
-            )
-            latest_timestamp = latest_result.scalar()
+            controllers = await list_enabled_controllers(session)
+            if not controllers:
+                logger.warning("No enabled controllers configured, skipping threat refresh")
+                return
 
-            # Calculate start time for query
-            # If we have events, get from last event time; otherwise get last 24 hours
-            if latest_timestamp:
-                # Add 1 second to avoid duplicates
-                start_ms = int((latest_timestamp.timestamp() + 1) * 1000)
-            else:
-                # First run - get last 24 hours
-                start_ms = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp() * 1000)
-
-            # Fetch events from UniFi
-            logger.debug(f"Fetching IPS events starting from timestamp: {start_ms}")
-            raw_events = await unifi_client.get_ips_events(start=start_ms)
-            logger.info(f"Retrieved {len(raw_events)} IPS events from UniFi")
-
-            # Log if no events returned for debugging
-            if not raw_events:
-                logger.debug("No IPS events returned from UniFi API - this may be normal if no threats detected")
-
-            # Process and store new events
-            new_count = 0
-            ignored_count = 0
-            for raw_event in raw_events:
-                event_data = parse_unifi_event(raw_event)
-
-                # Check if event already exists
-                existing = await session.execute(
-                    select(ThreatEvent).where(
-                        ThreatEvent.unifi_event_id == event_data['unifi_event_id']
+            had_success = False
+            for controller in controllers:
+                if not controller.is_active:
+                    logger.info("Skipping disabled controller '%s'", controller.controller_key)
+                    continue
+                try:
+                    ok = await _refresh_threat_events_for_controller(session, controller)
+                    had_success = had_success or ok
+                except Exception as controller_error:
+                    logger.error(
+                        "Threat refresh failed for controller '%s': %s",
+                        controller.controller_key,
+                        controller_error,
+                        exc_info=True,
                     )
-                )
-                if existing.scalar_one_or_none():
-                    continue  # Skip duplicate
+                    await invalidate_shared_client(controller.controller_key)
 
-                # Check ignore rules
-                should_ignore, ignore_rule_id = await check_ignore_rules(session, event_data)
+            if had_success:
+                _last_refresh = datetime.now(timezone.utc)
 
-                # Create new event with ignored flag
-                new_event = ThreatEvent(
-                    **event_data,
-                    ignored=should_ignore,
-                    ignored_by_rule_id=ignore_rule_id
-                )
-                session.add(new_event)
-                new_count += 1
-
-                if should_ignore:
-                    ignored_count += 1
-                    continue  # Skip webhooks for ignored events
-
-                # Trigger webhooks only for non-ignored events
-                action = event_data.get('action') or 'alert'
-                await trigger_threat_webhooks(session, event_data, action)
-
-            await session.commit()
-            _last_refresh = datetime.now(timezone.utc)
-
-            if new_count > 0:
-                if ignored_count > 0:
-                    logger.info(f"Stored {new_count} new threat events ({ignored_count} ignored)")
-                else:
-                    logger.info(f"Stored {new_count} new threat events")
-
-                # Broadcast update via WebSocket
-                ws_manager = get_ws_manager()
-                await ws_manager.broadcast({
-                    'type': 'threat_update',
-                    'new_events': new_count
-                })
-            else:
-                logger.debug("No new threat events")
-
-            break  # Exit the async for loop
+            break
 
         # Purge old events (runs at most once per hour)
         await purge_old_threat_events()
@@ -353,6 +306,87 @@ async def refresh_threat_events():
         logger.error(f"Error in threat refresh task: {e}", exc_info=True)
         # Invalidate shared session so next cycle reconnects (handles session expiry)
         await invalidate_shared_client()
+
+
+async def _refresh_threat_events_for_controller(
+    session: AsyncSession,
+    controller: ResolvedController,
+) -> bool:
+    """Refresh threat events for one controller in isolation."""
+    controller_id = controller.id
+    controller_key = controller.controller_key
+    unifi_client = await get_shared_client(controller_key=controller_key)
+    if not unifi_client:
+        logger.warning("No UniFi connection for controller '%s', skipping threat refresh", controller_key)
+        return False
+
+    latest_result = await session.execute(
+        select(func.max(ThreatEvent.timestamp)).where(ThreatEvent.controller_id == controller_id)
+    )
+    latest_timestamp = latest_result.scalar()
+    if latest_timestamp:
+        start_ms = int((latest_timestamp.timestamp() + 1) * 1000)
+    else:
+        start_ms = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp() * 1000)
+
+    logger.debug(
+        "Fetching IPS events for controller '%s' starting at %s",
+        controller_key,
+        start_ms,
+    )
+    raw_events = await unifi_client.get_ips_events(start=start_ms)
+    logger.info(
+        "Retrieved %s IPS events for controller '%s'",
+        len(raw_events),
+        controller_key,
+    )
+
+    new_count = 0
+    ignored_count = 0
+    for raw_event in raw_events:
+        event_data = parse_unifi_event(raw_event)
+        existing = await session.execute(
+            scoped_threat_events_query(controller_id).where(ThreatEvent.unifi_event_id == event_data['unifi_event_id'])
+        )
+        if existing.scalar_one_or_none():
+            continue
+
+        should_ignore, ignore_rule_id = await check_ignore_rules(session, controller_id, event_data)
+        new_event = ThreatEvent(
+            controller_id=controller_id,
+            **event_data,
+            ignored=should_ignore,
+            ignored_by_rule_id=ignore_rule_id
+        )
+        session.add(new_event)
+        new_count += 1
+        if should_ignore:
+            ignored_count += 1
+            continue
+
+        action = event_data.get('action') or 'alert'
+        await trigger_threat_webhooks(session, controller_id, event_data, action)
+
+    await session.commit()
+    _last_refresh_by_controller[controller_key] = datetime.now(timezone.utc)
+
+    if new_count > 0:
+        ws_manager = get_ws_manager()
+        await ws_manager.broadcast({
+            'type': 'threat_update',
+            'controller_key': controller_key,
+            'new_events': new_count
+        }, controller_key=controller_key)
+        logger.info(
+            "Stored %s new threat events for controller '%s' (%s ignored)",
+            new_count,
+            controller_key,
+            ignored_count,
+        )
+    else:
+        logger.debug("No new threat events for controller '%s'", controller_key)
+
+    return True
 
 
 async def purge_old_threat_events():

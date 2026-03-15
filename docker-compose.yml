@@ -1,11 +1,11 @@
 services:
   unifi-toolkit:
     # Use pre-built image from GitHub Container Registry (recommended)
-    image: ghcr.io/crosstalk-solutions/unifi-toolkit:latest
+    # image: ghcr.io/crosstalk-solutions/unifi-toolkit:latest
     # Or build locally by uncommenting below and commenting out 'image' above:
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
+    build:
+       context: .
+       dockerfile: Dockerfile
     container_name: unifi-toolkit
     restart: unless-stopped
     environment:

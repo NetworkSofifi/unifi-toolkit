@@ -4,6 +4,7 @@ Background task scheduler for refreshing device status
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Dict, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -13,16 +14,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from shared.database import get_database
 from shared.unifi_client import UniFiClient
 from shared.config import get_settings
+from shared.controller_registry import list_enabled_controllers, get_controller_by_id, ResolvedController
 from shared.websocket_manager import get_ws_manager
 from shared.webhooks import deliver_webhook
 from shared.unifi_session import get_shared_client, invalidate_shared_client
-from tools.wifi_stalker.database import TrackedDevice, ConnectionHistory, WebhookConfig, HourlyPresence
+from tools.wifi_stalker.database import (
+    TrackedDevice,
+    ConnectionHistory,
+    HourlyPresence,
+    scoped_tracked_devices_query,
+    scoped_connection_history_query,
+    scoped_webhooks_query,
+    scoped_hourly_presence_query,
+)
 
 logger = logging.getLogger(__name__)
 
 # Global scheduler instance
 _scheduler: AsyncIOScheduler = None
 _last_refresh: datetime = None
+_last_refresh_by_controller: Dict[str, datetime] = {}
 
 
 def get_scheduler() -> AsyncIOScheduler:
@@ -35,10 +46,12 @@ def get_scheduler() -> AsyncIOScheduler:
     return _scheduler
 
 
-def get_last_refresh() -> datetime:
+def get_last_refresh(controller_key: Optional[str] = None) -> datetime:
     """
     Get the timestamp of the last successful refresh
     """
+    if controller_key:
+        return _last_refresh_by_controller.get(controller_key)
     return _last_refresh
 
 
@@ -64,51 +77,86 @@ async def refresh_tracked_devices():
     global _last_refresh
 
     try:
-        logger.info("Starting device refresh task")
-
-        # Get shared UniFi client (reuses persistent session)
-        unifi_client = await get_shared_client()
-        if not unifi_client:
-            logger.warning("No UniFi connection available, skipping refresh")
-            return
-
-        # Get database session
+        logger.info("Starting device refresh task across controllers")
         db_instance = get_database()
         async for session in db_instance.get_session():
-            # Get all tracked devices
-            devices_result = await session.execute(select(TrackedDevice))
-            tracked_devices = devices_result.scalars().all()
-
-            if not tracked_devices:
-                logger.info("No devices to track, skipping refresh")
+            controllers = await list_enabled_controllers(session)
+            if not controllers:
+                logger.warning("No enabled controllers configured, skipping refresh")
                 return
 
-            logger.info(f"Refreshing {len(tracked_devices)} tracked devices")
+            had_success = False
+            for controller in controllers:
+                if not controller.is_active:
+                    logger.info("Skipping disabled controller '%s'", controller.controller_key)
+                    continue
+                try:
+                    success = await _refresh_tracked_devices_for_controller(session, controller)
+                    had_success = had_success or success
+                except Exception as controller_error:
+                    logger.error(
+                        "Device refresh failed for controller '%s': %s",
+                        controller.controller_key,
+                        controller_error,
+                        exc_info=True,
+                    )
+                    await invalidate_shared_client(controller.controller_key)
 
-            # Get all active clients from UniFi
-            active_clients = await unifi_client.get_clients()
-            logger.info(f"Retrieved {len(active_clients)} active clients from UniFi")
+            if had_success:
+                _last_refresh = datetime.now(timezone.utc)
 
-            # Process each tracked device
-            for device in tracked_devices:
-                await process_device(
-                    session,
-                    device,
-                    active_clients,
-                    unifi_client
-                )
-
-            # Commit all changes
-            await session.commit()
-            _last_refresh = datetime.now(timezone.utc)
-            logger.info("Device refresh completed successfully")
-
-            break  # Exit the async for loop after processing
+            break
 
     except Exception as e:
         logger.error(f"Error in refresh task: {e}", exc_info=True)
         # Invalidate shared session so next cycle reconnects (handles session expiry)
         await invalidate_shared_client()
+
+
+async def _refresh_tracked_devices_for_controller(
+    session: AsyncSession,
+    controller: ResolvedController,
+) -> bool:
+    """Refresh tracked devices for one controller in isolation."""
+    controller_id = controller.id
+    controller_key = controller.controller_key
+    unifi_client = await get_shared_client(controller_key=controller_key)
+    if not unifi_client:
+        logger.warning("No UniFi connection for controller '%s', skipping", controller_key)
+        return False
+
+    devices_result = await session.execute(scoped_tracked_devices_query(controller_id))
+    tracked_devices = devices_result.scalars().all()
+    if not tracked_devices:
+        logger.info("No tracked devices for controller '%s'", controller_key)
+        return True
+
+    logger.info(
+        "Refreshing %s tracked devices for controller '%s'",
+        len(tracked_devices),
+        controller_key,
+    )
+    active_clients = await unifi_client.get_clients()
+    logger.info(
+        "Retrieved %s active clients for controller '%s'",
+        len(active_clients),
+        controller_key,
+    )
+
+    for device in tracked_devices:
+        await process_device(
+            session,
+            device,
+            active_clients,
+            unifi_client,
+            controller_id,
+            controller_key,
+        )
+
+    await session.commit()
+    _last_refresh_by_controller[controller_key] = datetime.now(timezone.utc)
+    logger.info("Device refresh completed for controller '%s'", controller_key)
+    return True
 
 
 def _device_to_dict(device: TrackedDevice) -> dict:
@@ -145,6 +193,7 @@ def _device_to_dict(device: TrackedDevice) -> dict:
 
 async def trigger_webhooks(
     session: AsyncSession,
+    controller_id: int,
     event_type: str,
     device: TrackedDevice,
     offline_duration: int = None
@@ -159,10 +208,8 @@ async def trigger_webhooks(
         offline_duration: Duration in seconds the device was offline (for connected events)
     """
     # Get all enabled webhooks
-    result = await session.execute(
-        select(WebhookConfig).where(WebhookConfig.enabled == True)
-    )
-    webhooks = result.scalars().all()
+    result = await session.execute(scoped_webhooks_query(controller_id))
+    webhooks = [w for w in result.scalars().all() if w.enabled]
 
     if not webhooks:
         return
@@ -205,7 +252,9 @@ async def process_device(
     session: AsyncSession,
     device: TrackedDevice,
     active_clients: dict,
-    unifi_client: UniFiClient
+    unifi_client: UniFiClient,
+    controller_id: int,
+    controller_key: str,
 ):
     """
     Process a single tracked device (wireless or wired)
@@ -279,10 +328,11 @@ async def process_device(
 
                     # Close previous history entry if exists
                     if device.is_connected and device.current_switch_mac:
-                        await close_connection_history(session, device)
+                        await close_connection_history(session, device, controller_id)
 
                     # Create new history entry for wired device
                     new_history = ConnectionHistory(
+                        controller_id=controller_id,
                         device_id=device.id,
                         connected_at=datetime.now(timezone.utc),
                         is_wired=True,
@@ -302,10 +352,13 @@ async def process_device(
                     device.current_ap_name = None
 
                     # Broadcast update via WebSocket
-                    await ws_manager.broadcast_device_update(_device_to_dict(device))
+                    await ws_manager.broadcast_device_update({
+                        **_device_to_dict(device),
+                        "controller_key": controller_key,
+                    }, controller_key=controller_key)
 
                     # Trigger roaming webhooks (port changes are like roaming)
-                    await trigger_webhooks(session, 'roamed', device)
+                    await trigger_webhooks(session, controller_id, 'roamed', device)
 
         else:
             # Wireless device - track AP
@@ -332,6 +385,7 @@ async def process_device(
 
                     # Create new history entry for this connection
                     new_history = ConnectionHistory(
+                        controller_id=controller_id,
                         device_id=device.id,
                         ap_mac=ap_mac,
                         ap_name=ap_name,
@@ -348,12 +402,15 @@ async def process_device(
                     device.is_connected = True
 
                     # Broadcast connection event via WebSocket
-                    await ws_manager.broadcast_device_update(_device_to_dict(device))
+                    await ws_manager.broadcast_device_update({
+                        **_device_to_dict(device),
+                        "controller_key": controller_key,
+                    }, controller_key=controller_key)
 
                     # Calculate offline duration for webhook
                     offline_duration = None
                     history_result = await session.execute(
-                        select(ConnectionHistory)
+                        scoped_connection_history_query(controller_id)
                         .where(ConnectionHistory.device_id == device.id)
                         .where(ConnectionHistory.disconnected_at.isnot(None))
                         .order_by(ConnectionHistory.disconnected_at.desc())
@@ -369,7 +426,7 @@ async def process_device(
                         logger.debug(f"Device {device.mac_address} was offline for {offline_duration} seconds")
 
                     # Trigger connection webhooks with offline duration
-                    await trigger_webhooks(session, 'connected', device, offline_duration=offline_duration)
+                    await trigger_webhooks(session, controller_id, 'connected', device, offline_duration=offline_duration)
 
                 elif ap_changed:
                     # Device roamed to a different AP
@@ -380,10 +437,11 @@ async def process_device(
 
                     # Close previous history entry
                     if device.current_ap_mac:
-                        await close_connection_history(session, device)
+                        await close_connection_history(session, device, controller_id)
 
                     # Create new history entry for new AP
                     new_history = ConnectionHistory(
+                        controller_id=controller_id,
                         device_id=device.id,
                         ap_mac=ap_mac,
                         ap_name=ap_name,
@@ -399,10 +457,13 @@ async def process_device(
                     device.current_ap_name = ap_name
 
                     # Broadcast roaming event via WebSocket
-                    await ws_manager.broadcast_device_update(_device_to_dict(device))
+                    await ws_manager.broadcast_device_update({
+                        **_device_to_dict(device),
+                        "controller_key": controller_key,
+                    }, controller_key=controller_key)
 
                     # Trigger roaming webhooks
-                    await trigger_webhooks(session, 'roamed', device)
+                    await trigger_webhooks(session, controller_id, 'roamed', device)
 
         # Ensure device is marked as connected
         device.is_connected = True
@@ -413,16 +474,19 @@ async def process_device(
             logger.info(f"Device {device.mac_address} went offline")
 
             # Close any open history entries
-            await close_connection_history(session, device)
+            await close_connection_history(session, device, controller_id)
 
             # Mark device as disconnected
             device.is_connected = False
 
             # Broadcast disconnection event via WebSocket
-            await ws_manager.broadcast_device_update(_device_to_dict(device))
+            await ws_manager.broadcast_device_update({
+                **_device_to_dict(device),
+                "controller_key": controller_key,
+            }, controller_key=controller_key)
 
             # Trigger disconnection webhooks
-            await trigger_webhooks(session, 'disconnected', device)
+            await trigger_webhooks(session, controller_id, 'disconnected', device)
 
     # Always check blocked status (works for both online and offline devices)
     try:
@@ -431,15 +495,18 @@ async def process_device(
             logger.info(f"Device {device.mac_address} blocked status changed to {is_blocked}")
             device.is_blocked = is_blocked
             # Broadcast update via WebSocket
-            await ws_manager.broadcast_device_update(_device_to_dict(device))
+            await ws_manager.broadcast_device_update({
+                **_device_to_dict(device),
+                "controller_key": controller_key,
+            }, controller_key=controller_key)
             # Trigger blocked/unblocked webhooks
             event_type = 'blocked' if is_blocked else 'unblocked'
-            await trigger_webhooks(session, event_type, device)
+            await trigger_webhooks(session, controller_id, event_type, device)
     except Exception as e:
         logger.debug(f"Could not check blocked status for {device.mac_address}: {e}")
 
 
-async def close_connection_history(session: AsyncSession, device: TrackedDevice):
+async def close_connection_history(session: AsyncSession, device: TrackedDevice, controller_id: int):
     """
     Close the most recent open connection history entry for a device
 
@@ -449,7 +516,7 @@ async def close_connection_history(session: AsyncSession, device: TrackedDevice)
     """
     # Find the most recent open history entry
     result = await session.execute(
-        select(ConnectionHistory)
+        scoped_connection_history_query(controller_id)
         .where(ConnectionHistory.device_id == device.id)
         .where(ConnectionHistory.disconnected_at.is_(None))
         .order_by(ConnectionHistory.connected_at.desc())
@@ -492,12 +559,6 @@ async def refresh_single_device(device_id: int):
     try:
         logger.info(f"Refreshing single device ID: {device_id}")
 
-        # Get shared UniFi client (reuses persistent session)
-        unifi_client = await get_shared_client()
-        if not unifi_client:
-            logger.warning("No UniFi connection available, skipping refresh")
-            return
-
         # Get database session
         db_instance = get_database()
         async for session in db_instance.get_session():
@@ -511,6 +572,24 @@ async def refresh_single_device(device_id: int):
                 logger.warning(f"Device ID {device_id} not found")
                 return
 
+            controller_id = device.controller_id
+            controller = await get_controller_by_id(session, controller_id, include_inactive=True)
+            if not controller:
+                logger.warning(
+                    "Controller ID %s for device %s not found",
+                    controller_id,
+                    device_id,
+                )
+                return
+
+            unifi_client = await get_shared_client(controller_key=controller.controller_key)
+            if not unifi_client:
+                logger.warning(
+                    "No UniFi connection available for controller '%s', skipping refresh",
+                    controller.controller_key,
+                )
+                return
+
             # Get all active clients from UniFi
             active_clients = await unifi_client.get_clients()
 
@@ -519,7 +598,9 @@ async def refresh_single_device(device_id: int):
                 session,
                 device,
                 active_clients,
-                unifi_client
+                unifi_client,
+                controller_id,
+                controller.controller_key,
             )
 
             # Commit changes
@@ -601,51 +682,64 @@ async def aggregate_hourly_presence():
 
         db_instance = get_database()
         async for session in db_instance.get_session():
-            # Get all tracked wireless devices that are currently connected
-            result = await session.execute(
-                select(TrackedDevice).where(
-                    TrackedDevice.is_connected == True,
-                    TrackedDevice.is_wired == False
-                )
-            )
-            connected_devices = result.scalars().all()
-
-            if not connected_devices:
-                logger.debug("No connected wireless devices to aggregate")
+            controllers = await list_enabled_controllers(session)
+            if not controllers:
+                logger.debug("No enabled controllers configured, skipping hourly presence aggregation")
                 return
 
-            logger.info(f"Aggregating presence for {len(connected_devices)} connected devices")
-
-            for device in connected_devices:
-                # Find or create the hourly presence record for this slot
-                presence_result = await session.execute(
-                    select(HourlyPresence).where(
-                        HourlyPresence.device_id == device.id,
-                        HourlyPresence.day_of_week == day_of_week,
-                        HourlyPresence.hour_of_day == hour_of_day
+            for controller in controllers:
+                controller_id = controller.id
+                controller_key = controller.controller_key
+                # Get all tracked wireless devices that are currently connected
+                result = await session.execute(
+                    scoped_tracked_devices_query(controller_id).where(
+                        TrackedDevice.is_connected == True,
+                        TrackedDevice.is_wired == False
                     )
                 )
-                presence = presence_result.scalar_one_or_none()
+                connected_devices = result.scalars().all()
 
-                if presence:
-                    # Update existing record
-                    presence.total_minutes_connected += 60  # Add one hour
-                    presence.sample_count += 1
-                    presence.last_updated = now
-                else:
-                    # Create new record
-                    presence = HourlyPresence(
-                        device_id=device.id,
-                        day_of_week=day_of_week,
-                        hour_of_day=hour_of_day,
-                        total_minutes_connected=60,
-                        sample_count=1,
-                        last_updated=now
+                if not connected_devices:
+                    logger.debug("No connected wireless devices for controller '%s'", controller_key)
+                    continue
+
+                logger.info(
+                    "Aggregating presence for %s devices on controller '%s'",
+                    len(connected_devices),
+                    controller_key,
+                )
+
+                for device in connected_devices:
+                    # Find or create the hourly presence record for this slot
+                    presence_result = await session.execute(
+                        scoped_hourly_presence_query(controller_id).where(
+                            HourlyPresence.device_id == device.id,
+                            HourlyPresence.day_of_week == day_of_week,
+                            HourlyPresence.hour_of_day == hour_of_day
+                        )
                     )
-                    session.add(presence)
+                    presence = presence_result.scalar_one_or_none()
+
+                    if presence:
+                        # Update existing record
+                        presence.total_minutes_connected += 60  # Add one hour
+                        presence.sample_count += 1
+                        presence.last_updated = now
+                    else:
+                        # Create new record
+                        presence = HourlyPresence(
+                            controller_id=controller_id,
+                            device_id=device.id,
+                            day_of_week=day_of_week,
+                            hour_of_day=hour_of_day,
+                            total_minutes_connected=60,
+                            sample_count=1,
+                            last_updated=now
+                        )
+                        session.add(presence)
 
             await session.commit()
-            logger.info("Hourly presence aggregation completed")
+            logger.info("Hourly presence aggregation completed for %s controllers", len(controllers))
             break  # Exit the async for loop
 
     except Exception as e:

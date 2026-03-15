@@ -6,6 +6,8 @@
     <title>UI Toolkit - Dashboard</title>
     <link rel="icon" type="image/jpeg" href="/static/images/favicon16x16.jpg">
     <link rel="stylesheet" href="/static/css/dashboard.css">
+    <link rel="stylesheet" href="/static/css/controller-selector.css">
+    <script src="/static/js/controller-context.js"></script>
     <script>
         // Apply saved theme immediately to prevent flash
         (function() {
@@ -27,6 +29,11 @@
                 </div>
                 <div class="header-right">
                     <div class="header-actions">
+                        <div id="controller-selector-wrap" class="controller-selector-wrap" style="display: none;">
+                            <label for="controller-selector">Controller</label>
+                            <select id="controller-selector" class="controller-selector"></select>
+                        </div>
+                        <div id="controller-current-badge" class="controller-current-badge" style="display: none;"></div>
                         <a href="#" id="update-badge" class="update-badge" style="display: none;"
                            target="_blank" rel="noopener noreferrer"
                            title="A new version is available">
@@ -208,7 +215,45 @@
                     <button class="close-btn" id="close-modal-btn">&times;</button>
                 </div>
                 <div class="modal-body">
+                    <div class="controller-management">
+                        <h3 style="margin-bottom: 0.5rem;">Controller Management</h3>
+                        <p style="margin-bottom: 1rem; color: var(--text-secondary);">
+                            Manage multiple UniFi controllers. Select one above to scope dashboards and tools.
+                        </p>
+                        <div id="controller-empty-state" class="controller-empty-state" style="display: none;">
+                            No controllers are configured yet. Create one below to get started.
+                        </div>
+                        <div id="controller-list-container" style="display: none; margin-bottom: 1rem;">
+                            <table style="width: 100%; border-collapse: collapse;">
+                                <thead>
+                                    <tr style="text-align: left; color: var(--text-secondary); border-bottom: 1px solid var(--border-color);">
+                                        <th style="padding: 0.5rem 0.25rem;">Name</th>
+                                        <th style="padding: 0.5rem 0.25rem;">Key</th>
+                                        <th style="padding: 0.5rem 0.25rem;">Site</th>
+                                        <th style="padding: 0.5rem 0.25rem;">Status</th>
+                                        <th style="padding: 0.5rem 0.25rem;">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="controller-list-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
                     <form id="config-form">
+                        <div class="form-group">
+                            <label for="config-controller-key">Target Controller</label>
+                            <select id="config-controller-key" name="config_controller_key" class="controller-selector"></select>
+                            <small>Edit an existing controller, or choose "Create New Controller".</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="display_name">Display Name *</label>
+                            <input type="text" id="display_name" name="display_name" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="new_controller_key">Controller Key (optional)</label>
+                            <input type="text" id="new_controller_key" name="new_controller_key" placeholder="auto-generated-from-name">
+                            <small>Used in API and URL query params. Leave empty to auto-generate.</small>
+                        </div>
                         <div class="auth-info-box">
                             <strong>Authentication:</strong>
                             <p>
@@ -280,9 +325,18 @@
                         </div>
 
                         <div class="form-actions">
-                            <button type="submit" class="btn btn-primary">Save Config</button>
+                            <button type="submit" class="btn btn-primary" id="save-controller-btn">Save Controller</button>
                             <button type="button" id="test-connection-btn" class="btn btn-secondary">
                                 Test Connection
+                            </button>
+                            <button type="button" id="set-default-btn" class="btn btn-secondary">
+                                Set as Default
+                            </button>
+                            <button type="button" id="toggle-active-btn" class="btn btn-secondary">
+                                Disable Controller
+                            </button>
+                            <button type="button" id="delete-controller-btn" class="btn btn-secondary">
+                                Delete Controller
                             </button>
                             <button type="button" id="cancel-config-btn" class="btn btn-secondary">
                                 Cancel
@@ -341,7 +395,7 @@
                     </div>
                     <div class="tool-bottom">
                         <div class="tool-actions">
-                            <a href="/stalker/" class="btn btn-primary">Open Wi-Fi Stalker</a>
+                            <a href="/stalker/" class="btn btn-primary" data-controller-link>Open Wi-Fi Stalker</a>
                         </div>
                         <div class="tool-version">v{{ stalker_version }}</div>
                     </div>
@@ -363,7 +417,7 @@
                     <div class="tool-status" id="threat-watch-status" style="display: none;"></div>
                     <div class="tool-bottom">
                         <div class="tool-actions">
-                            <a href="/threats/" class="btn btn-primary" id="threat-watch-btn">Open Threat Watch</a>
+                            <a href="/threats/" class="btn btn-primary" id="threat-watch-btn" data-controller-link>Open Threat Watch</a>
                         </div>
                         <div class="tool-version">v{{ threat_watch_version }}</div>
                     </div>
@@ -384,7 +438,7 @@
                     </div>
                     <div class="tool-bottom">
                         <div class="tool-actions">
-                            <a href="/pulse/" class="btn btn-primary">Open Network Pulse</a>
+                            <a href="/pulse/" class="btn btn-primary" data-controller-link>Open Network Pulse</a>
                         </div>
                         <div class="tool-version">v{{ pulse_version }}</div>
                     </div>
@@ -482,6 +536,46 @@
                 updateThemeUI(newTheme);
             });
         })();
+
+        // Shared controller selection bootstrap
+        (function() {
+            const selector = document.getElementById('controller-selector');
+            const currentBadge = document.getElementById('controller-current-badge');
+
+            function renderSelector() {
+                if (!window.ControllerContext) return;
+                // Dashboard refetches system status on changeEvent; no need to reload the page
+                ControllerContext.initSelectorUi({
+                    onChange: () => {},
+                });
+            }
+
+            window.addEventListener(ControllerContext.changeEvent, () => {
+                renderSelector();
+                ControllerContext.decorateLinks();
+            });
+
+            ControllerContext.loadControllers()
+                .then(() => {
+                    ControllerContext.syncBrowserUrlParam();
+                    renderSelector();
+                    ControllerContext.decorateLinks();
+                    window.dispatchEvent(new CustomEvent('controller-context-ready'));
+                })
+                .catch(() => {
+                    currentBadge.style.display = 'inline-flex';
+                    currentBadge.textContent = 'Unable to load controllers';
+                    window.dispatchEvent(new CustomEvent('controller-context-ready'));
+                });
+        })();
+
+        function controllerAwareUrl(path) {
+            return window.ControllerContext ? ControllerContext.addControllerKeyToUrl(path) : path;
+        }
+
+        function controllerAwareFetch(path, options) {
+            return fetch(controllerAwareUrl(path), options);
+        }
 
         // System Status Widget
         (function() {
@@ -702,7 +796,7 @@
                 statusError.classList.remove('visible');
 
                 try {
-                    const response = await fetch('/api/system-status');
+                    const response = await controllerAwareFetch('/api/system-status');
                     const data = await response.json();
 
                     statusLoading.classList.remove('visible');
@@ -787,18 +881,34 @@
                 }
             }
 
-            // Load on page load and signal when done
-            loadSystemStatus().then(() => {
-                // Dispatch event to signal that system status is loaded and cache is ready
-                window.systemStatusLoadedFired = true;
-                window.dispatchEvent(new CustomEvent('systemStatusLoaded'));
+            // Wait for controller context so the first fetch uses the selected controller_key
+            function runWhenControllerReady(fn) {
+                if (window.ControllerContext && window.ControllerContext.getSelectedControllerKey) {
+                    fn();
+                    return;
+                }
+                window.addEventListener('controller-context-ready', fn, { once: true });
+            }
+
+            runWhenControllerReady(() => {
+                loadSystemStatus().then(() => {
+                    window.systemStatusLoadedFired = true;
+                    window.dispatchEvent(new CustomEvent('systemStatusLoaded'));
+                });
+            });
+
+            // When controller selection changes, refetch so dashboard shows the selected controller
+            window.addEventListener(ControllerContext.changeEvent, () => {
+                if (hasLoadedOnce) {
+                    loadSystemStatus();
+                }
             });
 
             // Refresh every 60 seconds
             setInterval(loadSystemStatus, 60000);
         })();
 
-        // UniFi Configuration Modal
+        // UniFi Configuration + Controller Management Modal
         (function() {
             const configModal = document.getElementById('config-modal');
             const configureLink = document.getElementById('configure-link');
@@ -806,12 +916,21 @@
             const cancelConfigBtn = document.getElementById('cancel-config-btn');
             const configForm = document.getElementById('config-form');
             const testConnectionBtn = document.getElementById('test-connection-btn');
+            const setDefaultBtn = document.getElementById('set-default-btn');
+            const toggleActiveBtn = document.getElementById('toggle-active-btn');
+            const deleteControllerBtn = document.getElementById('delete-controller-btn');
+            const saveControllerBtn = document.getElementById('save-controller-btn');
             const configMessage = document.getElementById('config-message');
             const legacyToggle = document.getElementById('legacy-toggle');
             const legacyFields = document.getElementById('legacy-fields');
             const legacyToggleIcon = document.getElementById('legacy-toggle-icon');
+            const controllerListBody = document.getElementById('controller-list-body');
+            const controllerListContainer = document.getElementById('controller-list-container');
+            const controllerEmptyState = document.getElementById('controller-empty-state');
+            const configControllerKey = document.getElementById('config-controller-key');
 
-            // Legacy section toggle
+            let controllers = [];
+
             function setLegacyOpen(open) {
                 if (open) {
                     legacyFields.classList.add('expanded');
@@ -830,7 +949,6 @@
                 setLegacyOpen(!isLegacyOpen());
             });
 
-            // Show config message
             function showConfigMessage(message, type = 'info') {
                 configMessage.textContent = message;
                 configMessage.className = `message ${type}`;
@@ -849,81 +967,46 @@
             }
 
             function formatApiError(payload, fallback = 'Request failed') {
-                if (!payload || typeof payload !== 'object') {
-                    return fallback;
-                }
-
-                if (typeof payload.error === 'string' && payload.error.trim()) {
-                    return payload.error;
-                }
-
-                const detail = payload.detail;
-                if (typeof detail === 'string' && detail.trim()) {
-                    return detail;
-                }
-
-                if (Array.isArray(detail) && detail.length > 0) {
-                    const messages = detail.map((item) => {
-                        if (!item || typeof item !== 'object') {
-                            return String(item);
-                        }
-                        const msg = item.msg || 'Validation error';
-                        const loc = Array.isArray(item.loc)
-                            ? item.loc.filter((part) => part !== 'body').join('.')
-                            : '';
-                        return loc ? `${loc}: ${msg}` : msg;
-                    });
-                    return messages.join('; ');
-                }
-
+                if (!payload || typeof payload !== 'object') return fallback;
+                if (typeof payload.error === 'string' && payload.error.trim()) return payload.error;
+                if (typeof payload.detail === 'string' && payload.detail.trim()) return payload.detail;
                 return fallback;
             }
 
-            // Open modal
-            function openModal() {
-                configModal.style.display = 'flex';
-                loadExistingConfig();
+            function getCurrentController() {
+                return controllers.find((c) => c.controller_key === configControllerKey.value) || null;
             }
 
-            // Close modal
-            function closeModal() {
-                configModal.style.display = 'none';
-                configMessage.style.display = 'none';
+            function clearSensitiveInputs() {
+                document.getElementById('password').value = '';
+                document.getElementById('api_key').value = '';
             }
 
-            // Load existing config
-            async function loadExistingConfig() {
-                try {
-                    const response = await fetch('/api/config/unifi');
-                    if (response.ok) {
-                        const config = await response.json();
-                        document.getElementById('controller_url').value = config.controller_url || '';
-                        document.getElementById('verify_ssl').checked = config.verify_ssl || false;
-
-                        // Only populate legacy fields if not using API key
-                        const hasLegacyCreds = config.username && !config.has_api_key;
-                        const hasCustomSite = config.site_id && config.site_id !== 'default';
-                        if (hasLegacyCreds) {
-                            document.getElementById('username').value = config.username || '';
-                        }
-                        if (hasLegacyCreds || hasCustomSite) {
-                            document.getElementById('site_id').value = config.site_id || '';
-                            setLegacyOpen(true);
-                        } else {
-                            document.getElementById('username').value = '';
-                            document.getElementById('site_id').value = '';
-                            setLegacyOpen(false);
-                        }
-                    }
-                } catch (error) {
-                    console.log('No existing config found');
+            function fillFormFromController(controller) {
+                document.getElementById('display_name').value = controller?.display_name || '';
+                document.getElementById('new_controller_key').value = '';
+                document.getElementById('controller_url').value = controller?.controller_url || '';
+                document.getElementById('verify_ssl').checked = !!controller?.verify_ssl;
+                document.getElementById('username').value = controller?.username || '';
+                document.getElementById('site_id').value = controller?.site_id || 'default';
+                clearSensitiveInputs();
+                if ((controller?.username && !controller?.has_api_key) || (controller?.site_id && controller.site_id !== 'default')) {
+                    setLegacyOpen(true);
+                } else {
+                    setLegacyOpen(false);
                 }
+                saveControllerBtn.textContent = controller ? 'Save Controller' : 'Create Controller';
+                setDefaultBtn.disabled = !controller || controller.is_default;
+                toggleActiveBtn.disabled = !controller;
+                toggleActiveBtn.textContent = controller && controller.is_active ? 'Disable Controller' : 'Enable Controller';
+                deleteControllerBtn.disabled = !controller;
             }
 
-            // Collect form data
-            function getFormData() {
+            function buildControllerPayload() {
                 const formData = new FormData(configForm);
                 return {
+                    display_name: formData.get('display_name'),
+                    controller_key: formData.get('new_controller_key') || null,
                     controller_url: formData.get('controller_url'),
                     username: formData.get('username') || null,
                     password: formData.get('password') || null,
@@ -933,171 +1016,256 @@
                 };
             }
 
-            // Save config (tests connection first, only saves if successful)
-            async function saveConfig(e) {
-                e.preventDefault();
+            function renderControllerSelect() {
+                const selectedKey = window.ControllerContext?.getSelectedControllerKey() || '';
+                const options = [
+                    '<option value="__new__">Create New Controller</option>',
+                    ...controllers.map((c) => `<option value="${c.controller_key}">${c.display_name}${c.is_default ? ' (default)' : ''}${!c.is_active ? ' (disabled)' : ''}</option>`)
+                ];
+                configControllerKey.innerHTML = options.join('');
+                if (selectedKey && controllers.some((c) => c.controller_key === selectedKey)) {
+                    configControllerKey.value = selectedKey;
+                } else if (controllers.length > 0) {
+                    configControllerKey.value = controllers[0].controller_key;
+                } else {
+                    configControllerKey.value = '__new__';
+                }
+                const selected = configControllerKey.value === '__new__'
+                    ? null
+                    : controllers.find((c) => c.controller_key === configControllerKey.value);
+                fillFormFromController(selected);
+            }
 
-                const data = getFormData();
-
-                // Validate that either password or API key is provided
-                if (!data.password && !data.api_key) {
-                    showConfigMessage('Please provide either an API key or username/password', 'error');
+            function renderControllerTable() {
+                if (controllers.length === 0) {
+                    controllerListContainer.style.display = 'none';
+                    controllerEmptyState.style.display = 'block';
                     return;
                 }
+                controllerListContainer.style.display = 'block';
+                controllerEmptyState.style.display = 'none';
+                controllerListBody.innerHTML = controllers.map((controller) => {
+                    const statusText = controller.is_active ? 'Active' : 'Disabled';
+                    return `
+                        <tr style="border-bottom: 1px solid var(--border-color);">
+                            <td style="padding: 0.5rem 0.25rem;">${controller.display_name}${controller.is_default ? ' ⭐' : ''}</td>
+                            <td style="padding: 0.5rem 0.25rem;"><code>${controller.controller_key}</code></td>
+                            <td style="padding: 0.5rem 0.25rem;">${controller.site_id}</td>
+                            <td style="padding: 0.5rem 0.25rem;">${statusText}</td>
+                            <td style="padding: 0.5rem 0.25rem;">
+                                <button type="button" class="btn btn-secondary btn-small" data-edit-controller="${controller.controller_key}">Edit</button>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
 
-                // Disable save button while testing
-                const saveBtn = configForm.querySelector('button[type="submit"]');
-                saveBtn.disabled = true;
-                saveBtn.textContent = 'Testing connection...';
+                controllerListBody.querySelectorAll('[data-edit-controller]').forEach((button) => {
+                    button.addEventListener('click', () => {
+                        configControllerKey.value = button.getAttribute('data-edit-controller');
+                        fillFormFromController(getCurrentController());
+                    });
+                });
+            }
 
+            async function loadControllerRegistry() {
+                const response = await fetch('/api/config/controllers', {
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                });
+                if (!response.ok) {
+                    throw new Error('Failed to load controllers');
+                }
+                controllers = await response.json();
+                renderControllerSelect();
+                renderControllerTable();
+            }
+
+            async function openModal() {
+                configModal.style.display = 'flex';
                 try {
-                    // First, test the connection with the provided credentials
-                    showConfigMessage('Testing connection before saving...', 'info');
-
-                    const testResponse = await fetch('/api/config/unifi/test', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-Requested-With': 'XMLHttpRequest'
-                        },
-                        body: JSON.stringify(data)
-                    });
-
-                    const testResult = await safeParseJson(testResponse);
-
-                    if (!testResponse.ok) {
-                        const errorMsg = formatApiError(
-                            testResult,
-                            `Request failed with HTTP ${testResponse.status}`
-                        );
-                        showConfigMessage(`Connection failed: ${errorMsg}. Configuration was NOT saved.`, 'error');
-                        saveBtn.disabled = false;
-                        saveBtn.textContent = 'Save Config';
-                        return;
-                    }
-
-                    if (!testResult || !testResult.connected) {
-                        const errorMsg = formatApiError(testResult, 'Unable to connect');
-                        showConfigMessage(`Connection failed: ${errorMsg}. Configuration was NOT saved.`, 'error');
-                        saveBtn.disabled = false;
-                        saveBtn.textContent = 'Save Config';
-                        return;
-                    }
-
-                    // Connection successful - now save the config
-                    saveBtn.textContent = 'Saving...';
-
-                    const response = await fetch('/api/config/unifi', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-Requested-With': 'XMLHttpRequest'
-                        },
-                        body: JSON.stringify(data)
-                    });
-
-                    const result = await safeParseJson(response);
-
-                    if (response.ok) {
-                        let message = `Connection verified (${testResult.client_count || 0} clients found). Configuration saved!`;
-                        showConfigMessage(message, 'success');
-                        // Reload system status after saving
-                        setTimeout(() => {
-                            closeModal();
-                            window.location.reload();
-                        }, 1500);
-                    } else {
-                        const errorMsg = formatApiError(
-                            result,
-                            `Failed to save configuration (HTTP ${response.status})`
-                        );
-                        showConfigMessage(errorMsg, 'error');
-                    }
+                    await loadControllerRegistry();
                 } catch (error) {
-                    showConfigMessage('Error: ' + error.message, 'error');
-                } finally {
-                    saveBtn.disabled = false;
-                    saveBtn.textContent = 'Save Config';
+                    showConfigMessage(error.message, 'error');
                 }
             }
 
-            // Test connection (tests the form data, not saved config)
-            async function testConnection() {
-                const data = getFormData();
+            function closeModal() {
+                configModal.style.display = 'none';
+                configMessage.style.display = 'none';
+            }
 
-                // Validate that either password or API key is provided
-                if (!data.password && !data.api_key) {
-                    showConfigMessage('Please provide either an API key or username/password', 'error');
+            async function saveController(event) {
+                event.preventDefault();
+                const payload = buildControllerPayload();
+                const selectedKey = configControllerKey.value;
+                const isNew = selectedKey === '__new__';
+
+                if (!payload.controller_url) {
+                    showConfigMessage('Controller URL is required', 'error');
+                    return;
+                }
+                if (isNew && !payload.password && !payload.api_key) {
+                    showConfigMessage('Provide either API key or username/password for new controllers', 'error');
                     return;
                 }
 
-                if (!data.controller_url) {
-                    showConfigMessage('Please enter a controller URL', 'error');
-                    return;
-                }
-
-                testConnectionBtn.disabled = true;
-                testConnectionBtn.textContent = 'Testing...';
-                showConfigMessage('Testing connection to UniFi controller...', 'info');
+                saveControllerBtn.disabled = true;
+                saveControllerBtn.textContent = isNew ? 'Creating...' : 'Saving...';
 
                 try {
-                    const response = await fetch('/api/config/unifi/test', {
-                        method: 'POST',
+                    const endpoint = isNew
+                        ? '/api/config/controllers'
+                        : `/api/config/controllers/${encodeURIComponent(selectedKey)}`;
+                    const method = isNew ? 'POST' : 'PUT';
+                    const response = await fetch(endpoint, {
+                        method,
                         headers: {
                             'Content-Type': 'application/json',
                             'X-Requested-With': 'XMLHttpRequest'
                         },
-                        body: JSON.stringify(data)
+                        body: JSON.stringify(payload)
                     });
                     const result = await safeParseJson(response);
-
                     if (!response.ok) {
-                        const errorMsg = formatApiError(
-                            result,
-                            `Request failed with HTTP ${response.status}`
-                        );
-                        showConfigMessage(`✗ Connection failed: ${errorMsg}`, 'error');
+                        showConfigMessage(formatApiError(result, 'Failed to save controller'), 'error');
                         return;
                     }
 
-                    if (result.connected) {
-                        let message = `✓ Connected successfully! Found ${result.client_count || 0} clients`;
-                        if (result.site_name) {
-                            message += ` in site "${result.site_name}"`;
-                        }
-                        showConfigMessage(message, 'success');
-                    } else {
-                        const errorMsg = formatApiError(result, 'Unknown error');
-                        showConfigMessage(`✗ Connection failed: ${errorMsg}`, 'error');
+                    showConfigMessage(isNew ? 'Controller created' : 'Controller saved', 'success');
+                    await loadControllerRegistry();
+                    await ControllerContext.loadControllers();
+                    ControllerContext.decorateLinks();
+                    if (isNew && result?.controller_key) {
+                        configControllerKey.value = result.controller_key;
+                        fillFormFromController(getCurrentController());
                     }
                 } catch (error) {
-                    showConfigMessage('Error testing connection: ' + error.message, 'error');
+                    showConfigMessage(error.message, 'error');
+                } finally {
+                    saveControllerBtn.disabled = false;
+                    saveControllerBtn.textContent = 'Save Controller';
+                }
+            }
+
+            async function testConnection() {
+                const selectedKey = configControllerKey.value;
+                const payload = buildControllerPayload();
+                testConnectionBtn.disabled = true;
+                testConnectionBtn.textContent = 'Testing...';
+
+                try {
+                    let response;
+                    if (selectedKey !== '__new__' && !payload.password && !payload.api_key) {
+                        response = await fetch(`/api/config/controllers/${encodeURIComponent(selectedKey)}/test`, {
+                            method: 'POST',
+                            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                        });
+                    } else {
+                        response = await fetch('/api/config/unifi/test', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Requested-With': 'XMLHttpRequest'
+                            },
+                            body: JSON.stringify(payload)
+                        });
+                    }
+                    const result = await safeParseJson(response);
+                    if (!response.ok || !result?.connected) {
+                        showConfigMessage(`Connection failed: ${formatApiError(result, 'Unknown error')}`, 'error');
+                        return;
+                    }
+                    showConfigMessage(`Connected successfully (${result.client_count || 0} clients found)`, 'success');
+                    // Do not reload controller list here — it refills the form from API and clears
+                    // display name, URL, and API key (sensitive fields are never returned).
+                } catch (error) {
+                    showConfigMessage(error.message, 'error');
                 } finally {
                     testConnectionBtn.disabled = false;
                     testConnectionBtn.textContent = 'Test Connection';
                 }
             }
 
-            // Event listeners
-            const settingsBtn = document.getElementById('settings-btn');
+            async function setDefaultController() {
+                const selected = getCurrentController();
+                if (!selected) return;
+                if (!confirm(`Set "${selected.display_name}" as the default controller?`)) return;
+                const response = await fetch(`/api/config/controllers/${encodeURIComponent(selected.controller_key)}/set-default`, {
+                    method: 'POST',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                });
+                const result = await safeParseJson(response);
+                if (!response.ok) {
+                    showConfigMessage(formatApiError(result, 'Failed to set default'), 'error');
+                    return;
+                }
+                showConfigMessage(`Default controller set to ${selected.display_name}`, 'success');
+                await loadControllerRegistry();
+                await ControllerContext.loadControllers();
+                ControllerContext.setSelectedController(selected.controller_key);
+            }
 
-            settingsBtn.addEventListener('click', openModal);
+            async function toggleControllerActive() {
+                const selected = getCurrentController();
+                if (!selected) return;
+                const action = selected.is_active ? 'disable' : 'enable';
+                if (!confirm(`${action.charAt(0).toUpperCase() + action.slice(1)} controller "${selected.display_name}"?`)) return;
+                const response = await fetch(`/api/config/controllers/${encodeURIComponent(selected.controller_key)}/set-active`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: JSON.stringify({ is_active: !selected.is_active })
+                });
+                const result = await safeParseJson(response);
+                if (!response.ok) {
+                    showConfigMessage(formatApiError(result, 'Failed to update active state'), 'error');
+                    return;
+                }
+                showConfigMessage(`Controller ${selected.is_active ? 'disabled' : 'enabled'}`, 'success');
+                await loadControllerRegistry();
+                await ControllerContext.loadControllers();
+            }
 
+            async function deleteController() {
+                const selected = getCurrentController();
+                if (!selected) return;
+                if (!confirm(`Delete controller "${selected.display_name}"?`)) return;
+
+                const response = await fetch(`/api/config/controllers/${encodeURIComponent(selected.controller_key)}`, {
+                    method: 'DELETE',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                });
+                const result = await safeParseJson(response);
+                if (!response.ok) {
+                    showConfigMessage(formatApiError(result, 'Failed to delete controller'), 'error');
+                    return;
+                }
+                showConfigMessage('Controller deleted', 'success');
+                await loadControllerRegistry();
+                await ControllerContext.loadControllers();
+            }
+
+            configControllerKey.addEventListener('change', () => {
+                const selected = configControllerKey.value === '__new__' ? null : getCurrentController();
+                fillFormFromController(selected);
+            });
+
+            document.getElementById('settings-btn').addEventListener('click', openModal);
             configureLink.addEventListener('click', (e) => {
                 e.preventDefault();
                 openModal();
             });
-
             closeModalBtn.addEventListener('click', closeModal);
             cancelConfigBtn.addEventListener('click', closeModal);
-            configForm.addEventListener('submit', saveConfig);
+            configForm.addEventListener('submit', saveController);
             testConnectionBtn.addEventListener('click', testConnection);
+            setDefaultBtn.addEventListener('click', setDefaultController);
+            toggleActiveBtn.addEventListener('click', toggleControllerActive);
+            deleteControllerBtn.addEventListener('click', deleteController);
 
-            // Close modal when clicking outside
             configModal.addEventListener('click', (e) => {
-                if (e.target === configModal) {
-                    closeModal();
-                }
+                if (e.target === configModal) closeModal();
             });
         })();
 
@@ -1115,7 +1283,7 @@
                 try {
                     // Add cache-busting param if forcing refresh
                     const url = forceRefresh ? '/api/config/gateway-check?refresh=1' : '/api/config/gateway-check';
-                    const response = await fetch(url);
+                    const response = await controllerAwareFetch(url);
                     const data = await response.json();
 
                     if (!data.configured) {
@@ -1176,17 +1344,21 @@
                 threatWatchStatus.innerHTML = '⏳ Checking...';
                 // Invalidate cache by making a direct API call
                 try {
-                    await fetch('/api/config/gateway-check?invalidate=1');
+                    await controllerAwareFetch('/api/config/gateway-check?invalidate=1');
                 } catch (e) {}
                 // Small delay then recheck
                 setTimeout(() => checkGatewayAvailability(true), 500);
             };
 
             // Wait for system status to load first (which populates the cache)
-            // This prevents the race condition where gateway-check runs before cache is ready
             window.addEventListener('systemStatusLoaded', () => {
                 checkGatewayAvailability();
             }, { once: true });
+
+            // When controller selection changes, re-check gateway for the new controller
+            window.addEventListener(ControllerContext.changeEvent, () => {
+                checkGatewayAvailability(true);
+            });
 
             // Fallback: if system status hasn't loaded within 5 seconds, check anyway
             setTimeout(() => {
@@ -1256,7 +1428,7 @@
                 copyMsg.style.opacity = '0';
 
                 try {
-                    const response = await fetch('/api/debug-info');
+                    const response = await controllerAwareFetch('/api/debug-info');
                     const info = await response.json();
                     debugText.value = formatDebugInfo(info);
                 } catch (error) {
@@ -1341,7 +1513,7 @@
 
                 try {
                     // Fetch debug info from API
-                    const response = await fetch('/api/debug-info');
+                    const response = await controllerAwareFetch('/api/debug-info');
                     const info = await response.json();
 
                     // Add app versions

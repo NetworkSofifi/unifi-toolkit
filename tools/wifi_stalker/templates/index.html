@@ -6,6 +6,8 @@
     <title>Wi-Fi Stalker - Device Tracking Dashboard</title>
     <link rel="icon" type="image/jpeg" href="/static/images/favicon16x16.jpg">
     <link rel="stylesheet" href="/stalker/static/css/styles.css">
+    <link rel="stylesheet" href="/static/css/controller-selector.css">
+    <script src="/static/js/controller-context.js"></script>
     <script>
         // Apply saved theme immediately to prevent flash
         (function() {
@@ -21,12 +23,17 @@
         <!-- Header -->
         <header>
             <div class="header-top">
-                <a href="/" class="back-to-dashboard">
+                <a href="/" class="back-to-dashboard" data-controller-link>
                     ← Back to Dashboard
                 </a>
             </div>
             <h1>📡 Wi-Fi Stalker</h1>
             <p class="subtitle">Track Wi-Fi clients through UniFi infrastructure</p>
+            <div id="controller-selector-wrap" class="controller-selector-wrap" style="margin: 0.75rem 0; display: none;">
+                <label for="controller-selector">Controller</label>
+                <select id="controller-selector" class="controller-selector"></select>
+                <div id="controller-current-badge" class="controller-current-badge" style="display: none;"></div>
+            </div>
             <p class="refresh-info">Device status refreshes automatically every <span x-text="refreshInterval || 60"></span> seconds</p>
             <div class="status-bar">
                 <span class="status-item">
@@ -799,7 +806,7 @@
 `;
 
                 try {
-                    const response = await fetch('/api/debug-info');
+                    const response = await (window.ControllerContext ? ControllerContext.apiFetch('/api/debug-info') : fetch('/api/debug-info'));
                     const info = await response.json();
 
                     body += `- **App Version:** ${info.app_version}\n`;

@@ -265,6 +265,35 @@ def _repair_schema():
             'api_key_encrypted': "api_key_encrypted BLOB",
         })
 
+        # Multi-controller scoping (controller_id) — add if migration was skipped
+        for table in (
+            'stalker_tracked_devices',
+            'stalker_connection_history',
+            'stalker_webhook_config',
+            'stalker_hourly_presence',
+            'threats_events',
+            'threats_webhook_config',
+            'threats_ignore_rules',
+        ):
+            _add_missing_columns(cursor, table, {
+                'controller_id': "controller_id INTEGER",
+            })
+
+        # If controller_config exists and we have a default, backfill NULL controller_id
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='controller_config'")
+        if cursor.fetchone():
+            cursor.execute("SELECT id FROM controller_config WHERE is_default = 1 ORDER BY id ASC LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                default_id = row[0]
+                for table in (
+                    'stalker_tracked_devices', 'stalker_connection_history', 'stalker_webhook_config',
+                    'stalker_hourly_presence', 'threats_events', 'threats_webhook_config', 'threats_ignore_rules',
+                ):
+                    cursor.execute(f"UPDATE {table} SET controller_id = ? WHERE controller_id IS NULL", (default_id,))
+                    if cursor.rowcount:
+                        print(f"Schema repair: backfilled controller_id for {table}")
+
         conn.commit()
         conn.close()
     except Exception as e:

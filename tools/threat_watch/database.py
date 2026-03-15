@@ -2,7 +2,7 @@
 Database models for Threat Watch
 """
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, Column, Integer, String, DateTime, Float, Text, Index
+from sqlalchemy import Boolean, Column, Integer, String, DateTime, Float, Text, Index, ForeignKey, UniqueConstraint, select
 from shared.models.base import Base
 
 
@@ -13,9 +13,10 @@ class ThreatEvent(Base):
     __tablename__ = "threats_events"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    controller_id = Column(Integer, ForeignKey("controller_config.id"), nullable=False, index=True)
 
     # UniFi identifiers
-    unifi_event_id = Column(String, unique=True, nullable=False, index=True)
+    unifi_event_id = Column(String, nullable=False, index=True)
     flow_id = Column(String, nullable=True)
 
     # Timestamp
@@ -70,7 +71,9 @@ class ThreatEvent(Base):
 
     # Indexes for common queries
     __table_args__ = (
+        UniqueConstraint('controller_id', 'unifi_event_id', name='uix_threat_event_controller_unifi_id'),
         Index('ix_threats_events_timestamp_severity', 'timestamp', 'severity'),
+        Index('ix_threats_events_controller_timestamp', 'controller_id', 'timestamp'),
         Index('ix_threats_events_src_ip_timestamp', 'src_ip', 'timestamp'),
     )
 
@@ -85,6 +88,7 @@ class ThreatWebhookConfig(Base):
     __tablename__ = "threats_webhook_config"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    controller_id = Column(Integer, ForeignKey("controller_config.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
     webhook_type = Column(String, nullable=False)  # 'slack', 'discord', 'n8n'
     url = Column(String, nullable=False)
@@ -112,6 +116,7 @@ class ThreatIgnoreRule(Base):
     __tablename__ = "threats_ignore_rules"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    controller_id = Column(Integer, ForeignKey("controller_config.id"), nullable=False, index=True)
     ip_address = Column(String, nullable=False, index=True)
     description = Column(String, nullable=True)  # e.g., "Home Assistant"
 
@@ -133,3 +138,18 @@ class ThreatIgnoreRule(Base):
 
     def __repr__(self):
         return f"<ThreatIgnoreRule(ip={self.ip_address}, enabled={self.enabled})>"
+
+
+def scoped_threat_events_query(controller_id: int):
+    """Base query for threat events within a controller context."""
+    return select(ThreatEvent).where(ThreatEvent.controller_id == controller_id)
+
+
+def scoped_threat_webhooks_query(controller_id: int):
+    """Base query for threat webhooks within a controller context."""
+    return select(ThreatWebhookConfig).where(ThreatWebhookConfig.controller_id == controller_id)
+
+
+def scoped_threat_ignore_rules_query(controller_id: int):
+    """Base query for threat ignore rules within a controller context."""
+    return select(ThreatIgnoreRule).where(ThreatIgnoreRule.controller_id == controller_id)

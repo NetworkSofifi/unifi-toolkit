@@ -56,6 +56,7 @@ class Database:
 
         # Import all models to ensure they're registered with Base
         from shared.models.unifi_config import UniFiConfig
+        from shared.models.controller_config import ControllerConfig
         # Tool models will be imported by their respective tools
 
         # Create all tables

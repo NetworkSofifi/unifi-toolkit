@@ -2,7 +2,17 @@
 Database models for Wi-Fi Stalker
 """
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, Column, Integer, String, DateTime, ForeignKey, LargeBinary, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    UniqueConstraint,
+    Index,
+    select,
+)
 from sqlalchemy.orm import relationship
 from shared.models.base import Base
 
@@ -14,7 +24,8 @@ class TrackedDevice(Base):
     __tablename__ = "stalker_tracked_devices"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    mac_address = Column(String, unique=True, nullable=False, index=True)
+    controller_id = Column(Integer, ForeignKey("controller_config.id"), nullable=False, index=True)
+    mac_address = Column(String, nullable=False, index=True)
     friendly_name = Column(String, nullable=True)
     added_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     last_seen = Column(DateTime, nullable=True)
@@ -38,6 +49,10 @@ class TrackedDevice(Base):
     # Relationship to hourly presence data
     hourly_presence = relationship("HourlyPresence", back_populates="device", cascade="all, delete-orphan")
 
+    __table_args__ = (
+        UniqueConstraint('controller_id', 'mac_address', name='uix_stalker_device_controller_mac'),
+    )
+
     def __repr__(self):
         return f"<TrackedDevice(mac={self.mac_address}, name={self.friendly_name}, connected={self.is_connected})>"
 
@@ -49,6 +64,7 @@ class ConnectionHistory(Base):
     __tablename__ = "stalker_connection_history"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    controller_id = Column(Integer, ForeignKey("controller_config.id"), nullable=False, index=True)
     device_id = Column(Integer, ForeignKey("stalker_tracked_devices.id"), nullable=False, index=True)
     ap_mac = Column(String, nullable=True)
     ap_name = Column(String, nullable=True)
@@ -66,6 +82,10 @@ class ConnectionHistory(Base):
     # Relationship to device
     device = relationship("TrackedDevice", back_populates="history")
 
+    __table_args__ = (
+        Index('ix_stalker_history_controller_device_connected', 'controller_id', 'device_id', 'connected_at'),
+    )
+
     def __repr__(self):
         return f"<ConnectionHistory(device_id={self.device_id}, ap={self.ap_name}, connected={self.connected_at})>"
 
@@ -78,6 +98,7 @@ class WebhookConfig(Base):
     __tablename__ = "stalker_webhook_config"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    controller_id = Column(Integer, ForeignKey("controller_config.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
     webhook_type = Column(String, nullable=False)  # 'slack', 'discord', 'n8n'
     url = Column(String, nullable=False)
@@ -106,6 +127,7 @@ class HourlyPresence(Base):
     __tablename__ = "stalker_hourly_presence"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    controller_id = Column(Integer, ForeignKey("controller_config.id"), nullable=False, index=True)
     device_id = Column(Integer, ForeignKey("stalker_tracked_devices.id"), nullable=False, index=True)
     day_of_week = Column(Integer, nullable=False)  # 0=Monday, 6=Sunday
     hour_of_day = Column(Integer, nullable=False)  # 0-23
@@ -117,7 +139,7 @@ class HourlyPresence(Base):
 
     # Unique constraint: one row per device per hour-slot
     __table_args__ = (
-        UniqueConstraint('device_id', 'day_of_week', 'hour_of_day', name='uix_device_hour_slot'),
+        UniqueConstraint('controller_id', 'device_id', 'day_of_week', 'hour_of_day', name='uix_controller_device_hour_slot'),
     )
 
     # Relationship to device
@@ -125,3 +147,23 @@ class HourlyPresence(Base):
 
     def __repr__(self):
         return f"<HourlyPresence(device_id={self.device_id}, day={self.day_of_week}, hour={self.hour_of_day})>"
+
+
+def scoped_tracked_devices_query(controller_id: int):
+    """Base query for tracked devices within a controller context."""
+    return select(TrackedDevice).where(TrackedDevice.controller_id == controller_id)
+
+
+def scoped_connection_history_query(controller_id: int):
+    """Base query for connection history within a controller context."""
+    return select(ConnectionHistory).where(ConnectionHistory.controller_id == controller_id)
+
+
+def scoped_webhooks_query(controller_id: int):
+    """Base query for stalker webhooks within a controller context."""
+    return select(WebhookConfig).where(WebhookConfig.controller_id == controller_id)
+
+
+def scoped_hourly_presence_query(controller_id: int):
+    """Base query for hourly presence within a controller context."""
+    return select(HourlyPresence).where(HourlyPresence.controller_id == controller_id)

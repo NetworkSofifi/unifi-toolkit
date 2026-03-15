@@ -14,11 +14,9 @@ from tools.threat_watch.routers import events, config, webhooks, ignore_rules
 from tools.threat_watch.database import ThreatEvent
 from tools.threat_watch.models import SystemStatus
 from tools.threat_watch.scheduler import get_last_refresh, DEFAULT_REFRESH_INTERVAL
+from shared.controller_context import ControllerContext, get_controller_context
 from shared.database import get_db_session
-from shared.models.unifi_config import UniFiConfig
-from shared.unifi_client import UniFiClient
-from shared.crypto import decrypt_password, decrypt_api_key
-from sqlalchemy import select
+from shared.controller_registry import get_controller_by_key, create_unifi_client
 import logging
 
 logger = logging.getLogger(__name__)
@@ -60,6 +58,7 @@ def create_app() -> FastAPI:
     @app.get("/")
     async def dashboard(
         request: Request,
+        controller: ControllerContext = Depends(get_controller_context),
         db: AsyncSession = Depends(get_db_session)
     ):
         """Serve the Threat Watch dashboard"""
@@ -75,8 +74,8 @@ def create_app() -> FastAPI:
 
         try:
             # First try to use cached gateway info
-            cached_gateway = cache.get_gateway_info()
-            cached_ips = cache.get_ips_settings()
+            cached_gateway = cache.get_gateway_info(controller_key=controller.controller_key)
+            cached_ips = cache.get_ips_settings(controller_key=controller.controller_key)
 
             if cached_gateway is not None:
                 logger.debug("Using cached gateway info for Threat Watch dashboard")
@@ -105,28 +104,17 @@ def create_app() -> FastAPI:
             else:
                 # No cache - fetch data directly
                 logger.debug("No cached gateway info, fetching directly for Threat Watch")
-                result = await db.execute(select(UniFiConfig).where(UniFiConfig.id == 1))
-                unifi_config = result.scalar_one_or_none()
+                unifi_config = await get_controller_by_key(
+                    db,
+                    controller_key=controller.controller_key,
+                    include_inactive=False,
+                )
 
                 if not unifi_config:
                     gateway_error = "UniFi controller not configured"
                 else:
                     # Fetch gateway info directly
-                    password = None
-                    api_key = None
-                    if unifi_config.password_encrypted:
-                        password = decrypt_password(unifi_config.password_encrypted)
-                    if unifi_config.api_key_encrypted:
-                        api_key = decrypt_api_key(unifi_config.api_key_encrypted)
-
-                    client = UniFiClient(
-                        host=unifi_config.controller_url,
-                        username=unifi_config.username,
-                        password=password,
-                        api_key=api_key,
-                        site=unifi_config.site_id,
-                        verify_ssl=unifi_config.verify_ssl
-                    )
+                    client = create_unifi_client(unifi_config)
 
                     try:
                         connected = await client.connect()
@@ -138,7 +126,7 @@ def create_app() -> FastAPI:
                             cache.set_gateway_info({
                                 **gateway_info,
                                 "is_unifi_os": client.is_unifi_os
-                            })
+                            }, controller_key=controller.controller_key)
 
                             if not gateway_info.get("has_gateway"):
                                 gateway_error = "No UniFi Gateway found on this site"
@@ -153,7 +141,7 @@ def create_app() -> FastAPI:
                                 # Get IPS settings
                                 ips_settings = await client.get_ips_settings()
                                 if ips_settings:
-                                    cache.set_ips_settings(ips_settings)
+                                    cache.set_ips_settings(ips_settings, controller_key=controller.controller_key)
                                     if not ips_settings.get("ips_enabled"):
                                         gateway_error = "ids_disabled"
                         else:
@@ -183,26 +171,34 @@ def create_app() -> FastAPI:
     # Status endpoint
     @app.get("/api/status", response_model=SystemStatus, tags=["status"])
     async def get_status(
+        controller: ControllerContext = Depends(get_controller_context),
         db: AsyncSession = Depends(get_db_session)
     ):
         """
         Get system status including last refresh time and event counts
         """
+        controller_id = controller.controller_id
+
         now = datetime.now(timezone.utc)
         day_ago = now - timedelta(days=1)
 
         # Get total event count
-        total_result = await db.execute(select(func.count(ThreatEvent.id)))
+        total_result = await db.execute(
+            select(func.count(ThreatEvent.id)).where(ThreatEvent.controller_id == controller_id)
+        )
         total_events = total_result.scalar() or 0
 
         # Get events in last 24 hours
         result_24h = await db.execute(
-            select(func.count(ThreatEvent.id)).where(ThreatEvent.timestamp >= day_ago)
+            select(func.count(ThreatEvent.id)).where(
+                ThreatEvent.controller_id == controller_id,
+                ThreatEvent.timestamp >= day_ago,
+            )
         )
         events_24h = result_24h.scalar() or 0
 
         return SystemStatus(
-            last_refresh=get_last_refresh(),
+            last_refresh=get_last_refresh(controller.controller_key),
             total_events=total_events,
             events_24h=events_24h,
             refresh_interval_seconds=DEFAULT_REFRESH_INTERVAL

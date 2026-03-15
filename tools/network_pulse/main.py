@@ -1,7 +1,7 @@
 """
 Network Pulse FastAPI application factory
 """
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
@@ -12,6 +12,7 @@ from tools.network_pulse.routers import stats
 from tools.network_pulse.models import SystemStatus
 from tools.network_pulse.scheduler import get_last_refresh, get_last_error, get_cached_data
 from shared.websocket_manager import get_ws_manager
+from shared.controller_context import ControllerContext, get_controller_context, resolve_websocket_controller_context
 from app.routers.auth import is_auth_enabled, verify_session
 
 logger = logging.getLogger(__name__)
@@ -66,13 +67,15 @@ def create_app() -> FastAPI:
 
     # Status endpoint
     @app.get("/api/status", response_model=SystemStatus, tags=["status"])
-    async def get_status():
+    async def get_status(
+        controller: ControllerContext = Depends(get_controller_context),
+    ):
         """Get system status including last refresh time and connection status"""
-        cached = get_cached_data()
+        cached = get_cached_data(controller.controller_key)
         return SystemStatus(
-            last_refresh=get_last_refresh(),
+            last_refresh=get_last_refresh(controller.controller_key),
             is_connected=cached is not None,
-            error=get_last_error()
+            error=get_last_error(controller.controller_key)
         )
 
     # WebSocket endpoint for real-time updates
@@ -91,8 +94,22 @@ def create_app() -> FastAPI:
                 logger.warning("Network Pulse WebSocket rejected: not authenticated")
                 return
 
+        selected_controller_key = websocket.query_params.get("controller_key")
+        try:
+            ws_context = await resolve_websocket_controller_context(selected_controller_key)
+        except Exception:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            logger.warning(
+                "Network Pulse WebSocket rejected: invalid controller selection (controller_key=%s)",
+                selected_controller_key or "default",
+            )
+            return
+
         ws_manager = get_ws_manager()
-        await ws_manager.connect(websocket)
+        await ws_manager.connect(
+            websocket,
+            controller_key=ws_context.controller_key if ws_context else None,
+        )
 
         try:
             while True:

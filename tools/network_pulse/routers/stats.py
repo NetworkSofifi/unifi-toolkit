@@ -1,17 +1,19 @@
 """
 API endpoints for Network Pulse dashboard data
 """
-from fastapi import APIRouter, HTTPException
-from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException
 
 from tools.network_pulse.scheduler import get_cached_data, get_last_refresh, get_last_error
 from tools.network_pulse.models import DashboardData, SystemStatus
+from shared.controller_context import ControllerContext, get_controller_context
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
 
 
 @router.get("", response_model=DashboardData)
-async def get_stats():
+async def get_stats(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """
     Get all dashboard statistics in one call.
 
@@ -24,7 +26,7 @@ async def get_stats():
     - Top clients by bandwidth
     - Network health by subsystem
     """
-    cached = get_cached_data()
+    cached = get_cached_data(controller.controller_key)
     if cached is None:
         raise HTTPException(
             status_code=503,
@@ -34,16 +36,20 @@ async def get_stats():
 
 
 @router.get("/gateway")
-async def get_gateway_stats():
+async def get_gateway_stats(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """Get just the gateway health statistics"""
-    cached = get_cached_data()
+    cached = get_cached_data(controller.controller_key)
     if cached is None:
         raise HTTPException(status_code=503, detail="Data not available")
     return cached.gateway
 
 
 @router.get("/bandwidth")
-async def get_bandwidth_stats():
+async def get_bandwidth_stats(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """
     Get bandwidth data for charts.
 
@@ -52,7 +58,7 @@ async def get_bandwidth_stats():
     - current_rx_rate: Current download rate (bytes/sec)
     - bandwidth_history: List of hourly data points
     """
-    cached = get_cached_data()
+    cached = get_cached_data(controller.controller_key)
     if cached is None:
         raise HTTPException(status_code=503, detail="Data not available")
     return {
@@ -63,43 +69,54 @@ async def get_bandwidth_stats():
 
 
 @router.get("/aps")
-async def get_ap_stats():
+async def get_ap_stats(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """Get access point status list"""
-    cached = get_cached_data()
+    cached = get_cached_data(controller.controller_key)
     if cached is None:
         raise HTTPException(status_code=503, detail="Data not available")
     return {"access_points": [ap.model_dump() for ap in cached.access_points]}
 
 
 @router.get("/clients")
-async def get_top_clients():
+async def get_top_clients(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """Get top clients by bandwidth usage"""
-    cached = get_cached_data()
+    cached = get_cached_data(controller.controller_key)
     if cached is None:
         raise HTTPException(status_code=503, detail="Data not available")
     return {"top_clients": [c.model_dump() for c in cached.top_clients]}
 
 
 @router.get("/health")
-async def get_network_health():
+async def get_network_health(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """Get network health by subsystem"""
-    cached = get_cached_data()
+    cached = get_cached_data(controller.controller_key)
     if cached is None:
         raise HTTPException(status_code=503, detail="Data not available")
     return cached.health.model_dump()
 
 
 @router.get("/devices")
-async def get_device_counts():
+async def get_device_counts(
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """Get device counts summary"""
-    cached = get_cached_data()
+    cached = get_cached_data(controller.controller_key)
     if cached is None:
         raise HTTPException(status_code=503, detail="Data not available")
     return cached.devices.model_dump()
 
 
 @router.get("/ap/{ap_mac}")
-async def get_ap_detail(ap_mac: str):
+async def get_ap_detail(
+    ap_mac: str,
+    controller: ControllerContext = Depends(get_controller_context),
+):
     """
     Get detailed information about a specific AP and its connected clients.
 
@@ -111,7 +128,7 @@ async def get_ap_detail(ap_mac: str):
         - clients: List of clients connected to this AP
         - clients_by_band: Radio band distribution for this AP
     """
-    cached = get_cached_data()
+    cached = get_cached_data(controller.controller_key)
     if cached is None:
         raise HTTPException(status_code=503, detail="Data not available")
 

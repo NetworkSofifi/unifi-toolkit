@@ -8,8 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, or_, and_
 
+from shared.controller_context import ControllerContext, get_controller_context
 from shared.database import get_db_session
-from tools.threat_watch.database import ThreatIgnoreRule, ThreatEvent
+from tools.threat_watch.database import (
+    ThreatIgnoreRule,
+    ThreatEvent,
+    scoped_threat_ignore_rules_query,
+)
 from tools.threat_watch.models import (
     IgnoreRuleCreate,
     IgnoreRuleUpdate,
@@ -35,7 +40,7 @@ def is_valid_ip(ip: str) -> bool:
     return all(0 <= int(octet) <= 255 for octet in octets)
 
 
-async def apply_ignore_rule_to_existing_events(db: AsyncSession, rule: ThreatIgnoreRule) -> int:
+async def apply_ignore_rule_to_existing_events(db: AsyncSession, controller_id: int, rule: ThreatIgnoreRule) -> int:
     """
     Apply an ignore rule to existing events in the database.
     Returns the number of events that were marked as ignored.
@@ -71,6 +76,7 @@ async def apply_ignore_rule_to_existing_events(db: AsyncSession, rule: ThreatIgn
         .where(
             and_(
                 or_(*ip_conditions),
+                ThreatEvent.controller_id == controller_id,
                 ThreatEvent.severity.in_(severity_values),
                 ThreatEvent.ignored == False
             )
@@ -89,14 +95,17 @@ async def apply_ignore_rule_to_existing_events(db: AsyncSession, rule: ThreatIgn
     return count
 
 
-async def remove_ignore_rule_from_events(db: AsyncSession, rule_id: int) -> int:
+async def remove_ignore_rule_from_events(db: AsyncSession, controller_id: int, rule_id: int) -> int:
     """
     Remove ignore flag from events that were ignored by a specific rule.
     Returns the number of events that were unmarked.
     """
     result = await db.execute(
         update(ThreatEvent)
-        .where(ThreatEvent.ignored_by_rule_id == rule_id)
+        .where(
+            ThreatEvent.controller_id == controller_id,
+            ThreatEvent.ignored_by_rule_id == rule_id
+        )
         .values(ignored=False, ignored_by_rule_id=None)
     )
     return result.rowcount
@@ -104,12 +113,16 @@ async def remove_ignore_rule_from_events(db: AsyncSession, rule_id: int) -> int:
 
 @router.get("", response_model=IgnoreRulesListResponse)
 async def get_ignore_rules(
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get all configured ignore rules
     """
-    result = await db.execute(select(ThreatIgnoreRule).order_by(ThreatIgnoreRule.created_at.desc()))
+    controller_id = controller.controller_id
+    result = await db.execute(
+        scoped_threat_ignore_rules_query(controller_id).order_by(ThreatIgnoreRule.created_at.desc())
+    )
     rules = result.scalars().all()
 
     return IgnoreRulesListResponse(
@@ -121,11 +134,14 @@ async def get_ignore_rules(
 @router.post("", response_model=IgnoreRuleResponse)
 async def create_ignore_rule(
     rule: IgnoreRuleCreate,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Create a new ignore rule
     """
+    controller_id = controller.controller_id
+
     # Validate IP address
     if not is_valid_ip(rule.ip_address):
         raise HTTPException(
@@ -148,6 +164,7 @@ async def create_ignore_rule(
         )
 
     new_rule = ThreatIgnoreRule(
+        controller_id=controller_id,
         ip_address=rule.ip_address,
         description=rule.description,
         ignore_high=rule.ignore_high,
@@ -164,7 +181,7 @@ async def create_ignore_rule(
 
     # Apply rule to existing events
     if new_rule.enabled:
-        await apply_ignore_rule_to_existing_events(db, new_rule)
+        await apply_ignore_rule_to_existing_events(db, controller_id, new_rule)
         await db.commit()
         await db.refresh(new_rule)
 
@@ -174,13 +191,15 @@ async def create_ignore_rule(
 @router.get("/{rule_id}", response_model=IgnoreRuleResponse)
 async def get_ignore_rule(
     rule_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Get a specific ignore rule
     """
+    controller_id = controller.controller_id
     result = await db.execute(
-        select(ThreatIgnoreRule).where(ThreatIgnoreRule.id == rule_id)
+        scoped_threat_ignore_rules_query(controller_id).where(ThreatIgnoreRule.id == rule_id)
     )
     rule = result.scalar_one_or_none()
 
@@ -194,13 +213,15 @@ async def get_ignore_rule(
 async def update_ignore_rule(
     rule_id: int,
     update: IgnoreRuleUpdate,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Update an ignore rule
     """
+    controller_id = controller.controller_id
     result = await db.execute(
-        select(ThreatIgnoreRule).where(ThreatIgnoreRule.id == rule_id)
+        scoped_threat_ignore_rules_query(controller_id).where(ThreatIgnoreRule.id == rule_id)
     )
     rule = result.scalar_one_or_none()
 
@@ -246,7 +267,7 @@ async def update_ignore_rule(
         )
 
     # First, unmark events that were ignored by this rule
-    await remove_ignore_rule_from_events(db, rule.id)
+    await remove_ignore_rule_from_events(db, controller_id, rule.id)
     rule.events_ignored = 0
 
     await db.commit()
@@ -254,7 +275,7 @@ async def update_ignore_rule(
 
     # Re-apply rule to existing events with updated criteria
     if rule.enabled:
-        await apply_ignore_rule_to_existing_events(db, rule)
+        await apply_ignore_rule_to_existing_events(db, controller_id, rule)
         await db.commit()
         await db.refresh(rule)
 
@@ -264,13 +285,15 @@ async def update_ignore_rule(
 @router.delete("/{rule_id}", response_model=SuccessResponse)
 async def delete_ignore_rule(
     rule_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Delete an ignore rule
     """
+    controller_id = controller.controller_id
     result = await db.execute(
-        select(ThreatIgnoreRule).where(ThreatIgnoreRule.id == rule_id)
+        scoped_threat_ignore_rules_query(controller_id).where(ThreatIgnoreRule.id == rule_id)
     )
     rule = result.scalar_one_or_none()
 
@@ -280,7 +303,7 @@ async def delete_ignore_rule(
     ip = rule.ip_address
 
     # Unmark events that were ignored by this rule
-    unmarked = await remove_ignore_rule_from_events(db, rule_id)
+    unmarked = await remove_ignore_rule_from_events(db, controller_id, rule_id)
     if unmarked > 0:
         logger.info(f"Unmarked {unmarked} events when deleting ignore rule {rule_id}")
 
@@ -293,13 +316,15 @@ async def delete_ignore_rule(
 @router.post("/{rule_id}/reset-counter", response_model=SuccessResponse)
 async def reset_ignore_counter(
     rule_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
     Reset the events_ignored counter for a rule
     """
+    controller_id = controller.controller_id
     result = await db.execute(
-        select(ThreatIgnoreRule).where(ThreatIgnoreRule.id == rule_id)
+        scoped_threat_ignore_rules_query(controller_id).where(ThreatIgnoreRule.id == rule_id)
     )
     rule = result.scalar_one_or_none()
 

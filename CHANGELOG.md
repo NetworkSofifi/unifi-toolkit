@@ -2,6 +2,25 @@
 
 All notable changes to UI Toolkit will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Multi-controller hardening pass** - Consolidated frontend controller-selector behavior via a shared controller context utility and reduced duplicated page-specific selector logic.
+
+### Security
+- **Config mutation request hardening** - Controller/config mutation endpoints now require `X-Requested-With: XMLHttpRequest` and enforce same-origin checks for browser session flows in production auth mode.
+- **Secret-safe errors** - Controller test/config paths now avoid returning low-level crypto/client initialization errors to the frontend.
+
+### Fixed
+- **Migration safety for unconfigured legacy installs** - Controller scoping migration no longer inserts placeholder controller rows. It now fails clearly when existing tool data cannot be deterministically mapped to a controller.
+
+### Added
+- **Controller validation improvements** - Added strict server-side validation for controller URL format, site ID format, and controller key/display name normalization.
+- **Documentation** - Added `docs/MULTI_CONTROLLER.md` with architecture, selection behavior, upgrade path, and deferred limitations.
+- **Tests** - Added migration bootstrap safety tests and expanded controller mutation validation tests.
+
+---
+
 ## [1.9.17] - 2026-02-21
 
 ### Fixed

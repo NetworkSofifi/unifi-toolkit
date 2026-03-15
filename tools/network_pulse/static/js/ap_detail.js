@@ -23,6 +23,7 @@ function apDetail() {
          */
         async init() {
             console.log('Initializing AP Detail page');
+            await this.initControllerContext();
 
             // Extract AP MAC from URL path
             const path = window.location.pathname;
@@ -43,12 +44,30 @@ function apDetail() {
             await this.loadData();
         },
 
+        async initControllerContext() {
+            if (!window.ControllerContext) return;
+            await ControllerContext.loadControllers();
+            ControllerContext.syncBrowserUrlParam();
+            ControllerContext.decorateLinks();
+
+            const backLink = document.querySelector('.back-link');
+            if (backLink) {
+                backLink.href = ControllerContext.addControllerKeyToUrl('/pulse/');
+            }
+
+            ControllerContext.initSelectorUi();
+        },
+
+        apiFetch(url, options) {
+            return window.ControllerContext ? ControllerContext.apiFetch(url, options) : fetch(url, options);
+        },
+
         /**
          * Load AP details from API
          */
         async loadData() {
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/stats/ap/${encodeURIComponent(this.apMac)}`);
+                const response = await this.apiFetch(`${API_BASE_PATH}/api/stats/ap/${encodeURIComponent(this.apMac)}`);
 
                 if (!response.ok) {
                     if (response.status === 404) {

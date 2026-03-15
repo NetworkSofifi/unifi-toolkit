@@ -6,6 +6,8 @@
     <title>AP Details - Network Pulse</title>
     <link rel="icon" type="image/jpeg" href="/static/images/favicon16x16.jpg">
     <link rel="stylesheet" href="/pulse/static/css/styles.css">
+    <link rel="stylesheet" href="/static/css/controller-selector.css">
+    <script src="/static/js/controller-context.js"></script>
     <script>
         // Apply saved theme immediately (default to dark for monitoring displays)
         (function() {
@@ -239,10 +241,15 @@
         <!-- Header -->
         <header class="dashboard-header">
             <div class="header-left">
-                <a href="/pulse/" class="back-link">← Back to Network Pulse</a>
+                <a href="/pulse/" class="back-link" data-controller-link>← Back to Network Pulse</a>
             </div>
             <div class="header-center">
                 <h1>📶 AP Details</h1>
+                <div id="controller-selector-wrap" class="controller-selector-wrap" style="margin-top: 0.5rem; display: none; justify-content: center;">
+                    <label for="controller-selector">Controller</label>
+                    <select id="controller-selector" class="controller-selector"></select>
+                    <div id="controller-current-badge" class="controller-current-badge" style="display: none;"></div>
+                </div>
             </div>
             <div class="header-right">
                 <!-- Empty for balance -->
@@ -397,7 +404,7 @@
 `;
 
                 try {
-                    const response = await fetch('/api/debug-info');
+                    const response = await (window.ControllerContext ? ControllerContext.apiFetch('/api/debug-info') : fetch('/api/debug-info'));
                     const info = await response.json();
 
                     body += `- **App Version:** ${info.app_version}\n`;

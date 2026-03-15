@@ -109,6 +109,7 @@ Access at **https://your-domain.com**
 | Guide | Description |
 |-------|-------------|
 | [INSTALLATION.md](docs/INSTALLATION.md) | Complete installation guide with troubleshooting |
+| [MULTI_CONTROLLER.md](docs/MULTI_CONTROLLER.md) | Multi-controller architecture, upgrade behavior, and limitations |
 | [SYNOLOGY.md](docs/SYNOLOGY.md) | Synology NAS Container Manager setup |
 | [QNAP Guide](https://github.com/Crosstalk-Solutions/unifi-toolkit/issues/29) | QNAP Container Station setup (community) |
 | [Unraid Guide](docs/UNRAID.md) | Unraid Community apps Setup |
@@ -183,6 +184,13 @@ Configure via `.env` or the web UI (web UI takes precedence):
 | `UNIFI_VERIFY_SSL` | SSL verification (default: `false`) |
 
 > **Note:** Use your controller's local IP address (e.g., `https://192.168.1.1`). Cloud access via `unifi.ui.com` is not supported.
+
+### Multi-Controller Notes
+
+- Use the dashboard controller selector to scope all tool pages to a specific controller.
+- Controller selection persists in browser storage and is reflected in URL `controller_key` for bookmark/share stability.
+- Existing single-controller installs are upgraded by materializing legacy config into the controller registry.
+- Aggregate all-controller dashboards are intentionally not implemented yet.
 
 #### Tool Settings
 

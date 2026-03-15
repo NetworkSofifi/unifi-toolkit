@@ -6,10 +6,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timezone
 
+from shared.controller_context import ControllerContext, get_controller_context
 from shared.database import get_db_session
 from shared.webhooks import deliver_webhook
 from shared.url_validator import validate_webhook_url
-from tools.wifi_stalker.database import WebhookConfig
+from tools.wifi_stalker.database import WebhookConfig, scoped_webhooks_query
 from tools.wifi_stalker.models import (
     WebhookCreate,
     WebhookUpdate,
@@ -22,11 +23,16 @@ router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
 
 @router.get("", response_model=WebhooksListResponse)
-async def list_webhooks(session: AsyncSession = Depends(get_db_session)):
+async def list_webhooks(
+    controller: ControllerContext = Depends(get_controller_context),
+    session: AsyncSession = Depends(get_db_session),
+):
     """
     Get all configured webhooks
     """
-    result = await session.execute(select(WebhookConfig))
+    controller_id = controller.controller_id
+
+    result = await session.execute(scoped_webhooks_query(controller_id))
     webhooks = result.scalars().all()
 
     return WebhooksListResponse(
@@ -38,6 +44,7 @@ async def list_webhooks(session: AsyncSession = Depends(get_db_session)):
 @router.post("", response_model=WebhookResponse)
 async def create_webhook(
     webhook: WebhookCreate,
+    controller: ControllerContext = Depends(get_controller_context),
     session: AsyncSession = Depends(get_db_session)
 ):
     """
@@ -59,7 +66,10 @@ async def create_webhook(
         )
 
     # Create new webhook
+    controller_id = controller.controller_id
+
     new_webhook = WebhookConfig(
+        controller_id=controller_id,
         name=webhook.name,
         webhook_type=webhook.webhook_type,
         url=webhook.url,
@@ -79,14 +89,14 @@ async def create_webhook(
 @router.get("/{webhook_id}", response_model=WebhookResponse)
 async def get_webhook(
     webhook_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     session: AsyncSession = Depends(get_db_session)
 ):
     """
     Get a specific webhook by ID
     """
-    result = await session.execute(
-        select(WebhookConfig).where(WebhookConfig.id == webhook_id)
-    )
+    controller_id = controller.controller_id
+    result = await session.execute(scoped_webhooks_query(controller_id).where(WebhookConfig.id == webhook_id))
     webhook = result.scalar_one_or_none()
 
     if not webhook:
@@ -99,14 +109,14 @@ async def get_webhook(
 async def update_webhook(
     webhook_id: int,
     webhook_update: WebhookUpdate,
+    controller: ControllerContext = Depends(get_controller_context),
     session: AsyncSession = Depends(get_db_session)
 ):
     """
     Update an existing webhook
     """
-    result = await session.execute(
-        select(WebhookConfig).where(WebhookConfig.id == webhook_id)
-    )
+    controller_id = controller.controller_id
+    result = await session.execute(scoped_webhooks_query(controller_id).where(WebhookConfig.id == webhook_id))
     webhook = result.scalar_one_or_none()
 
     if not webhook:
@@ -144,14 +154,14 @@ async def update_webhook(
 @router.delete("/{webhook_id}", response_model=SuccessResponse)
 async def delete_webhook(
     webhook_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     session: AsyncSession = Depends(get_db_session)
 ):
     """
     Delete a webhook
     """
-    result = await session.execute(
-        select(WebhookConfig).where(WebhookConfig.id == webhook_id)
-    )
+    controller_id = controller.controller_id
+    result = await session.execute(scoped_webhooks_query(controller_id).where(WebhookConfig.id == webhook_id))
     webhook = result.scalar_one_or_none()
 
     if not webhook:
@@ -166,14 +176,14 @@ async def delete_webhook(
 @router.post("/{webhook_id}/test", response_model=SuccessResponse)
 async def test_webhook(
     webhook_id: int,
+    controller: ControllerContext = Depends(get_controller_context),
     session: AsyncSession = Depends(get_db_session)
 ):
     """
     Test a webhook by sending a test notification
     """
-    result = await session.execute(
-        select(WebhookConfig).where(WebhookConfig.id == webhook_id)
-    )
+    controller_id = controller.controller_id
+    result = await session.execute(scoped_webhooks_query(controller_id).where(WebhookConfig.id == webhook_id))
     webhook = result.scalar_one_or_none()
 
     if not webhook:
